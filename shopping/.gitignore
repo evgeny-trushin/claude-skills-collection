@@ -6,3 +6,7 @@ __pycache__/
 *.egg-info/
 .Python
 .venv/
+01-redact/input_invoices/*.pdf
+02-predict/input_invoices/*.pdf
+02-predict/input_invoices/*.md
+02-predict/output_extracted/extracted_data.json
