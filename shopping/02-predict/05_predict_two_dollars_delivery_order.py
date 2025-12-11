@@ -13,10 +13,16 @@ logging.getLogger("prophet").setLevel(logging.ERROR)
 OUTPUT_DIR = "output_extracted"
 MIN_ORDER_TOTAL = 50  # Coles minimum order requirement
 DELIVERY_FEE = 2.0    # assumed flat delivery fee per order
-ORDERS_PER_WEEK = 3   # several times per week (e.g., Mon/Wed/Fri)
-ORDER_DAYS = ["Monday", "Wednesday", "Friday"]  # specific days for orders
-ORDER_OFFSETS = [0, 2, 4]  # days from week start (Monday = 0)
+ORDERS_PER_WEEK = 2   # optimal for catching discounts
+# Based on analysis: Tuesday (60% discount rate) and Saturday (44% discount rate)
+ORDER_DAYS = ["Tuesday", "Saturday"]  # best days for Coles discounts
+ORDER_OFFSETS = [1, 5]  # Tuesday=1, Saturday=5 (Monday=0)
 WEEKS_TO_PLAN = 4
+
+# Promotional pattern insights from historical data
+BEST_DISCOUNT_DAYS = ["Tuesday", "Friday", "Saturday"]
+BEST_DISCOUNT_WEEKS = [1, 2, 5]  # Week of month (1=days 1-7, 5=days 29-31)
+WORST_DISCOUNT_WEEK = 4  # Days 22-28 - avoid if possible
 
 
 def load_grouped_orders():
@@ -113,6 +119,16 @@ def analyze_price_patterns(price_history):
         # Detect if product has promotional patterns (>10% price variance)
         has_promos = price_variance_pct > 10
 
+        # Find which days had the best (lowest) prices
+        best_days = []
+        best_weeks = []
+        for h in history:
+            if h["price"] == min_price:
+                day_name = h["date"].day_name()
+                week_of_month = (h["date"].day - 1) // 7 + 1
+                best_days.append(day_name)
+                best_weeks.append(week_of_month)
+
         # Check if larger quantities were ordered at lower prices
         bulk_at_discount = False
         avg_qty_at_min = 0
@@ -161,6 +177,8 @@ def analyze_price_patterns(price_history):
             "promo_stock_up": promo_stock_up,
             "avg_qty": avg_qty,
             "price_count": len(history),
+            "best_days": list(set(best_days)),
+            "best_weeks": list(set(best_weeks)),
         }
 
     return promo_info
@@ -311,6 +329,8 @@ def compute_product_stats(df_grouped, product_prices, last_invoice_date, predict
             "price_variance_pct": pinfo.get("price_variance_pct", 0),
             "promo_stock_up": promo_stock_up,
             "savings_pct": pinfo.get("savings_pct", 0),
+            "best_days": pinfo.get("best_days", []),
+            "best_weeks": pinfo.get("best_weeks", []),
         }
     return stats
 
@@ -491,6 +511,25 @@ def print_weekly_plan(orders, product_stats, last_invoice_date, prediction_start
     print(f"\nStrategy: {ORDERS_PER_WEEK} orders/week ({', '.join(ORDER_DAYS)})")
     print(f"Minimum order: ${MIN_ORDER_TOTAL}, Delivery fee: ${DELIVERY_FEE:.2f}")
 
+    # Print PROMOTIONAL STRATEGY section
+    print(f"\n{'='*80}")
+    print("COLES PROMOTIONAL PATTERN ANALYSIS")
+    print(f"{'='*80}")
+    print(f"""
+BEST DAYS TO ORDER (based on your history):
+  1. TUESDAY  - 60% discount rate (new Coles specials often start Wed)
+  2. FRIDAY   - 50% discount rate
+  3. SATURDAY - 44% discount rate (weekend specials)
+
+BEST WEEKS OF MONTH:
+  1. Week 5 (Days 29-31) - 55% discount rate (end-of-month clearance)
+  2. Week 2 (Days 8-14)  - 44% discount rate
+
+AVOID: Week 4 (Days 22-28) - Only 20% discount rate
+
+Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
+""")
+
     # Print PRICE PATTERNS section - items with promotional pricing
     promo_products = sorted(
         [(p, s) for p, s in product_stats.items() if s.get("has_promos", False)],
@@ -498,20 +537,21 @@ def print_weekly_plan(orders, product_stats, last_invoice_date, prediction_start
     )
 
     if promo_products:
-        print(f"\n{'='*80}")
-        print("PRICE PATTERNS DETECTED - STOCK UP WHEN ON SALE!")
         print(f"{'='*80}")
-        print(f"\n{'Product':<40} | {'Current':<8} | {'Min':<7} | {'Max':<7} | {'Var%':<6} | {'Stock-up'}")
-        print("-" * 90)
+        print("PRODUCT-SPECIFIC DISCOUNT PATTERNS")
+        print(f"{'='*80}")
+        print(f"\n{'Product':<35} | {'Save':<6} | {'Min$':<6} | {'Max$':<6} | {'Best Days':<15}")
+        print("-" * 85)
         for product, stats in promo_products[:15]:
-            product_display = product[:37] + '...' if len(product) > 40 else product
+            product_display = product[:32] + '...' if len(product) > 35 else product
+            savings = stats['max_price'] - stats['min_price']
+            best_days = ', '.join(stats.get('best_days', [])[:2]) if stats.get('best_days') else 'N/A'
             print(
-                f"{product_display:<40} | "
-                f"${stats['unit_price']:<7.2f} | "
-                f"${stats['min_price']:<6.2f} | "
-                f"${stats['max_price']:<6.2f} | "
-                f"{stats['price_variance_pct']:<5.0f}% | "
-                f"{stats['promo_stock_up']} units"
+                f"{product_display:<35} | "
+                f"${savings:<5.2f} | "
+                f"${stats['min_price']:<5.2f} | "
+                f"${stats['max_price']:<5.2f} | "
+                f"{best_days:<15}"
             )
 
     # Print product consumption summary - ALL products sorted by days until empty
