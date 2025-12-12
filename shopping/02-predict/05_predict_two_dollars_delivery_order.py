@@ -17,7 +17,7 @@ ORDERS_PER_WEEK = 2   # optimal for catching discounts
 # Based on analysis: Tuesday (60% discount rate) and Saturday (44% discount rate)
 ORDER_DAYS = ["Tuesday", "Saturday"]  # best days for Coles discounts
 ORDER_OFFSETS = [1, 5]  # Tuesday=1, Saturday=5 (Monday=0)
-WEEKS_TO_PLAN = 4
+PREDICTION_WINDOW_DAYS = 30  # only plan one month ahead from last invoice
 
 # Promotional pattern insights from historical data
 BEST_DISCOUNT_DAYS = ["Tuesday", "Friday", "Saturday"]
@@ -335,21 +335,24 @@ def compute_product_stats(df_grouped, product_prices, last_invoice_date, predict
     return stats
 
 
-def generate_order_dates(start_date):
-    """Generate future order dates several times per week starting from start_date."""
+def generate_order_dates(start_date, end_date):
+    """Generate future order dates several times per week within the planning window."""
+    if start_date > end_date:
+        return []
+
     dates = []
     week_start = start_date - timedelta(days=start_date.weekday())  # Monday of this week
     weeks_seen = 0
 
-    while len(dates) < WEEKS_TO_PLAN * ORDERS_PER_WEEK:
+    while True:
         start = week_start + timedelta(days=7 * weeks_seen)
+        if start > end_date:
+            break
         for offset in ORDER_OFFSETS[:ORDERS_PER_WEEK]:
             order_date = start + timedelta(days=offset)
-            if order_date < start_date:
+            if order_date < start_date or order_date > end_date:
                 continue
             dates.append(order_date)
-            if len(dates) >= WEEKS_TO_PLAN * ORDERS_PER_WEEK:
-                break
         weeks_seen += 1
 
     return dates
@@ -497,7 +500,7 @@ def consolidate_small_orders(orders):
     return orders
 
 
-def print_weekly_plan(orders, product_stats, last_invoice_date, prediction_start):
+def print_weekly_plan(orders, product_stats, last_invoice_date, prediction_start, horizon_end):
     if not orders:
         print("No predicted orders found to build a weekly plan.")
         return
@@ -508,6 +511,7 @@ def print_weekly_plan(orders, product_stats, last_invoice_date, prediction_start
     print(f"\nLast invoice date: {last_invoice_date.strftime('%A, %d %B %Y')}")
     print(f"Prediction starts: {prediction_start.strftime('%A, %d %B %Y')}")
     print(f"Days since last order: {(prediction_start - last_invoice_date).days}")
+    print(f"Planning horizon ends: {horizon_end.strftime('%A, %d %B %Y')} (30 days from last invoice)")
     print(f"\nStrategy: {ORDERS_PER_WEEK} orders/week ({', '.join(ORDER_DAYS)})")
     print(f"Minimum order: ${MIN_ORDER_TOTAL}, Delivery fee: ${DELIVERY_FEE:.2f}")
 
@@ -535,19 +539,22 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
         [(p, s) for p, s in product_stats.items() if s.get("has_promos", False)],
         key=lambda x: -x[1].get("price_variance_pct", 0)
     )
+    promo_col_width = max(
+        35,
+        min(80, max((len(p[0]) for p in promo_products[:15]), default=0) + 2)
+    )
 
     if promo_products:
         print(f"{'='*80}")
         print("PRODUCT-SPECIFIC DISCOUNT PATTERNS")
         print(f"{'='*80}")
-        print(f"\n{'Product':<35} | {'Save':<6} | {'Min$':<6} | {'Max$':<6} | {'Best Days':<15}")
-        print("-" * 85)
+        print(f"\n{'Product':<{promo_col_width}} | {'Save':<6} | {'Min$':<6} | {'Max$':<6} | {'Best Days':<15}")
+        print("-" * (promo_col_width + 45))
         for product, stats in promo_products[:15]:
-            product_display = product[:32] + '...' if len(product) > 35 else product
             savings = stats['max_price'] - stats['min_price']
             best_days = ', '.join(stats.get('best_days', [])[:2]) if stats.get('best_days') else 'N/A'
             print(
-                f"{product_display:<35} | "
+                f"{product:<{promo_col_width}} | "
                 f"${savings:<5.2f} | "
                 f"${stats['min_price']:<5.2f} | "
                 f"${stats['max_price']:<5.2f} | "
@@ -564,8 +571,13 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
         key=lambda x: x[1]["days_until_empty"]
     )
 
-    print(f"\n{'Product':<40} | {'Stock':<6} | {'Days':<8} | {'$/unit':<7} | {'Note'}")
-    print("-" * 80)
+    stock_col_width = max(
+        40,
+        min(80, max((len(p[0]) for p in all_products), default=0) + 2)
+    )
+
+    print(f"\n{'Product':<{stock_col_width}} | {'Stock':<6} | {'Days':<8} | {'$/unit':<7} | {'Note'}")
+    print("-" * (stock_col_width + 36))
     for product, stats in all_products[:25]:  # Show top 25
         days_left = stats["days_until_empty"]
         if days_left == float('inf'):
@@ -583,9 +595,8 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
         else:
             note = ""
 
-        product_display = product[:37] + '...' if len(product) > 40 else product
         print(
-            f"{product_display:<40} | "
+            f"{product:<{stock_col_width}} | "
             f"{stats['estimated_stock']:<6.1f} | "
             f"{days_str:<8} | "
             f"${stats['unit_price']:<6.2f} | "
@@ -599,8 +610,20 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
 
     total_spend = 0
     orders_placed = 0
+    order_product_names = [
+        item["product"]
+        for order in orders
+        if not order.get("skipped")
+        for item in order["items"]
+    ]
+    order_product_col_width = max(
+        42,
+        min(80, max((len(name) for name in order_product_names), default=0) + 2)
+    )
 
-    for week in range(WEEKS_TO_PLAN):
+    week_count = math.ceil(len(orders) / ORDERS_PER_WEEK) if orders else 0
+
+    for week in range(week_count):
         start = week * ORDERS_PER_WEEK
         end = start + ORDERS_PER_WEEK
         week_orders = orders[start:end]
@@ -630,8 +653,8 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
                 for note in order["notes"]:
                     print(f"  Note: {note}")
 
-            print(f"\n  {'Product':<42} | {'Qty':<4} | {'$Unit':<7} | {'$Total':<7} | Notes")
-            print("  " + "-" * 75)
+            print(f"\n  {'Product':<{order_product_col_width}} | {'Qty':<4} | {'$Unit':<7} | {'$Total':<7} | Notes")
+            print("  " + "-" * (order_product_col_width + 32))
 
             for item in sorted(order["items"], key=lambda x: -x["total_price"]):
                 notes = []
@@ -648,9 +671,8 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
                     else:
                         notes.append(f"sale@${pstats.get('min_price', 0):.2f}")
 
-                product_display = item['product'][:39] + '...' if len(item['product']) > 42 else item['product']
                 print(
-                    f"  {product_display:<42} | "
+                    f"  {item['product']:<{order_product_col_width}} | "
                     f"{item['qty']:<4} | "
                     f"${item['unit_price']:<6.2f} | "
                     f"${item['total_price']:<6.2f} | "
@@ -687,16 +709,23 @@ def predict_two_dollar_delivery_orders():
     promo_count = sum(1 for p in promo_info.values() if p.get("has_promos", False))
     print(f"Analyzed price history: {len(price_history)} products, {promo_count} with promotional patterns.")
 
-    # Start predictions from today (or day after last invoice if that's in the future)
+    # Plan for one month from the last invoice date
+    horizon_end = last_invoice_date + timedelta(days=PREDICTION_WINDOW_DAYS)
     today = pd.Timestamp.now().normalize()
     prediction_start = max(today, last_invoice_date + timedelta(days=1))
+    if prediction_start > horizon_end:
+        print(f"Last invoice is over {PREDICTION_WINDOW_DAYS} days old; no forward window to plan.")
+        return
 
     product_stats = compute_product_stats(df_grouped, product_prices, last_invoice_date, prediction_start, promo_info)
     if not product_stats:
         print("No products with measurable demand.")
         return
 
-    order_dates = generate_order_dates(prediction_start)
+    order_dates = generate_order_dates(prediction_start, horizon_end)
+    if not order_dates:
+        print("No order dates fall within the one-month planning window.")
+        return
     orders = build_minimal_orders(product_stats, order_dates, prediction_start)
     enforce_minimums(orders, product_stats)
     consolidate_small_orders(orders)
@@ -708,7 +737,7 @@ def predict_two_dollar_delivery_orders():
             order["total_with_delivery"] = order["items_total"] + DELIVERY_FEE if order["items_total"] > 0 else 0
             order["meets_minimum"] = order["items_total"] >= MIN_ORDER_TOTAL
 
-    print_weekly_plan(orders, product_stats, last_invoice_date, prediction_start)
+    print_weekly_plan(orders, product_stats, last_invoice_date, prediction_start, horizon_end)
 
 
 if __name__ == "__main__":
