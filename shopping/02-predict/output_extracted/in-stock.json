@@ -1,0 +1,13 @@
+{
+  "stock_date": "2025-12-16",
+  "items": [
+    {
+      "product": "Coles Broccoli",
+      "quantity": 20
+    },
+    {
+      "product": "Beerenberg Tomato Sauce",
+      "quantity": 1
+    }
+  ]
+}
