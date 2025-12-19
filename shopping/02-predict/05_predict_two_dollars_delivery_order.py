@@ -25,6 +25,62 @@ BEST_DISCOUNT_WEEKS = [1, 2, 5]  # Week of month (1=days 1-7, 5=days 29-31)
 WORST_DISCOUNT_WEEK = 4  # Days 22-28 - avoid if possible
 
 
+def load_in_stock():
+    """Load in-stock data from in-stock.json and return a dict with fuzzy-matched product names."""
+    stock_file = os.path.join(OUTPUT_DIR, "in-stock.json")
+    if not os.path.exists(stock_file):
+        print(f"Note: {stock_file} not found. Using estimated stock levels.")
+        return {}, None
+
+    try:
+        with open(stock_file, "r") as f:
+            stock_data = json.load(f)
+
+        stock_date = stock_data.get("stock_date")
+        if stock_date:
+            stock_date = pd.to_datetime(stock_date)
+
+        # Create a mapping of partial names to quantities
+        in_stock = {}
+        for item in stock_data.get("items", []):
+            product_partial = item.get("product", "").lower().strip()
+            quantity = item.get("quantity", 0)
+            in_stock[product_partial] = quantity
+
+        print(f"Loaded in-stock data from {stock_date.strftime('%Y-%m-%d') if stock_date else 'unknown date'}: {len(in_stock)} items")
+        return in_stock, stock_date
+    except Exception as e:
+        print(f"Warning: Error loading in-stock.json: {e}")
+        return {}, None
+
+
+def match_product_to_stock(product_name, in_stock_dict):
+    """Fuzzy match a product name to items in the in-stock dictionary."""
+    # Normalize the product name: remove %, strip, lowercase
+    product_lower = product_name.lower().replace("%", "").strip()
+    # Remove possessives and normalize apostrophes
+    product_lower = product_lower.replace("''s", "").replace("'s", "").replace("'s", "")
+    product_lower = product_lower.replace("''", " ").replace("'", " ").replace("'", " ")
+    # Normalize multiple spaces
+    product_lower = " ".join(product_lower.split())
+
+    # Direct match check - check if all words from stock key appear in product
+    for stock_key, qty in in_stock_dict.items():
+        # Also normalize stock key
+        stock_normalized = stock_key.replace("''s", "").replace("'s", "").replace("'s", "")
+        stock_normalized = stock_normalized.replace("''", " ").replace("'", " ").replace("'", " ")
+        stock_normalized = " ".join(stock_normalized.split())
+
+        # Check if stock key words are in product (allows for extra words in product)
+        stock_words = stock_normalized.split()
+        product_words = product_lower.split()
+
+        if all(word in product_words for word in stock_words):
+            return qty
+
+    return None
+
+
 def load_grouped_orders():
     data_file = os.path.join(OUTPUT_DIR, "extracted_data.json")
     if not os.path.exists(data_file):
@@ -184,27 +240,25 @@ def analyze_price_patterns(price_history):
     return promo_info
 
 
-def compute_product_stats(df_grouped, product_prices, last_invoice_date, prediction_start, promo_info=None):
+def compute_product_stats(df_grouped, product_prices, last_invoice_date, prediction_start, promo_info=None, in_stock_dict=None, stock_date=None):
     """Calculate daily consumption and estimate current stock levels.
 
-    BETTER LOGIC for stock estimation:
-    ===================================
-    The key insight is that each ORDER is meant to last until the NEXT order.
-
-    So if you order every 10 days on average, and you ordered 3 units last time,
-    those 3 units are meant to last ~10 days, giving daily_rate = 3/10 = 0.3/day.
+    CONSUMPTION CALCULATION LOGIC:
+    ================================
+    - Consumption window = period between ordering two consecutive same products
+    - If ordered only once = time between the oldest invoice and that order
+    - Average consumption = total quantity / total time period from oldest invoice to last order
 
     For stock estimation:
-    - avg_qty_per_order = total_qty / order_count
-    - avg_interval = average days between orders
-    - daily_rate = avg_qty_per_order / avg_interval
-
-    Current stock = last_order_qty - (daily_rate × days_since_last_order)
-
-    If multiple orders are close together, we sum recent orders' remaining stock.
+    - If in-stock data provided: use actual stock from in-stock.json
+    - Otherwise: last_order_qty - (daily_rate × days_since_last_order)
     """
     stats = {}
     promo_info = promo_info or {}
+    in_stock_dict = in_stock_dict or {}
+
+    # Find the oldest invoice date across all products
+    oldest_invoice_date = df_grouped["ds"].min()
 
     for product in df_grouped["product"].unique():
         product_df = df_grouped[df_grouped["product"] == product].sort_values("ds")
@@ -232,32 +286,32 @@ def compute_product_stats(df_grouped, product_prices, last_invoice_date, predict
             continue  # Skip one-time purchases that are old
 
         # =========================================================
-        # BETTER CONSUMPTION RATE CALCULATION
+        # CONSUMPTION RATE CALCULATION
         # =========================================================
-        # Key: Each order is meant to last until the next order
-        # daily_rate = avg_qty_per_order / avg_interval
+        # Consumption period is from the oldest invoice to the last order of this product
+        # This gives us the total time period over which consumption occurred
 
         avg_qty_per_order = total_qty / order_count
 
-        if order_count >= 2 and avg_interval and not pd.isna(avg_interval) and avg_interval > 0:
-            # Use the actual reorder interval to estimate consumption
-            daily_rate = avg_qty_per_order / avg_interval
-        else:
-            # For single orders, estimate how long the order should last based on quantity
-            # Heuristic: larger quantities are meant to last longer
-            # - 1-2 units: ~7 days (weekly purchase)
-            # - 3-5 units: ~14 days (fortnightly)
-            # - 6-10 units: ~21 days (3 weeks)
-            # - 10+ units: ~30 days (monthly)
-            if avg_qty_per_order <= 2:
-                estimated_duration = 7
-            elif avg_qty_per_order <= 5:
-                estimated_duration = 14
-            elif avg_qty_per_order <= 10:
-                estimated_duration = 21
+        if order_count >= 2:
+            # Multiple orders: calculate from first order to last order of this product
+            total_consumption_period = (last_date - first_date).days
+            if total_consumption_period > 0:
+                daily_rate = total_qty / total_consumption_period
             else:
-                estimated_duration = 30
-            daily_rate = avg_qty_per_order / estimated_duration
+                # Orders on same day - use avg interval from differences
+                if avg_interval and not pd.isna(avg_interval) and avg_interval > 0:
+                    daily_rate = avg_qty_per_order / avg_interval
+                else:
+                    daily_rate = avg_qty_per_order / 7  # Default to weekly
+        else:
+            # Single order: consumption period is from oldest invoice to this order
+            total_consumption_period = (last_date - oldest_invoice_date).days
+            if total_consumption_period > 0:
+                daily_rate = total_qty / total_consumption_period
+            else:
+                # Order is on the oldest invoice date - default to weekly consumption
+                daily_rate = total_qty / 7
 
         weekly_need = daily_rate * 7
 
@@ -268,11 +322,9 @@ def compute_product_stats(df_grouped, product_prices, last_invoice_date, predict
         elif weekly_need >= 0.5:  # Need at least half unit per week
             frequent = True
 
-        # For frequent items, allow more per order; for infrequent, limit to reduce stock
-        if frequent:
-            max_per_order = min(3, math.ceil(weekly_need / ORDERS_PER_WEEK * 2))  # Cover 2 order periods
-        else:
-            max_per_order = 1
+        # Calculate max_per_order based on actual ordering behavior
+        # Use the average quantity per order as the baseline, rounded up
+        max_per_order = max(1, math.ceil(avg_qty_per_order))
 
         # Get promo info for this product
         pinfo = promo_info.get(product, {})
@@ -287,22 +339,25 @@ def compute_product_stats(df_grouped, product_prices, last_invoice_date, predict
         last_order_qty = product_df[product_df["ds"] == last_date]["y"].sum() if not product_df.empty else 0
 
         # =========================================================
-        # STOCK ESTIMATION - LAST ORDER DEPLETION MODEL
+        # STOCK ESTIMATION
         # =========================================================
-        # Key insight: You order BECAUSE you're out (or nearly out) of stock.
-        # Therefore, each order RESETS your stock to the order quantity.
-        #
-        # The correct model:
-        # - Last order qty = your stock at that moment
-        # - Consume at daily_rate until now
-        # - Current stock = last_order_qty - (daily_rate × days_since_last_order)
-        #
-        # This is simpler and more accurate than simulation because it
-        # reflects actual shopping behavior: order when you run out.
+        # Priority 1: Use actual stock from in-stock.json if available
+        # Priority 2: Estimate based on last order depletion model
 
-        # Stock = last order quantity - consumption since then
-        consumed_since_last = daily_rate * days_since_last_order
-        estimated_stock = max(0, last_order_qty - consumed_since_last)
+        actual_stock = match_product_to_stock(product, in_stock_dict)
+        stock_source = "estimated"
+
+        if actual_stock is not None and stock_date:
+            # Use actual stock from in-stock.json
+            # Calculate consumption from stock_date to prediction_start
+            days_since_stock_date = (prediction_start - stock_date).days
+            consumed_since_stock_date = daily_rate * days_since_stock_date
+            estimated_stock = max(0, actual_stock - consumed_since_stock_date)
+            stock_source = "actual"
+        else:
+            # Estimate based on last order depletion model
+            consumed_since_last = daily_rate * days_since_last_order
+            estimated_stock = max(0, last_order_qty - consumed_since_last)
 
         # Days until stock runs out
         days_until_empty = estimated_stock / daily_rate if daily_rate > 0 else float('inf')
@@ -321,6 +376,7 @@ def compute_product_stats(df_grouped, product_prices, last_invoice_date, predict
             "last_order_date": last_date,
             "last_order_qty": last_order_qty,
             "days_since_last_order": days_since_last_order,
+            "stock_source": stock_source,  # "actual" or "estimated"
             # Promo info
             "has_promos": has_promos,
             "min_price": pinfo.get("min_price", unit_price),
@@ -406,8 +462,20 @@ def build_minimal_orders(product_stats, order_dates, start_date):
             # Only order if stock will run out before next order
             if current_stock < needed_for_period:
                 shortfall = needed_for_period - current_stock
-                # Order just enough to cover until next order (rounded up)
-                qty_to_order = min(max_per_order, max(1, math.ceil(shortfall)))
+                # Order in the typical batch size based on historical ordering behavior
+                # This respects the user's actual ordering patterns (e.g., buying 3 pizzas at once)
+                # Use avg_qty_per_order as the default, but ensure at least the shortfall is covered
+                avg_qty = stats["avg_qty_per_order"]
+                if shortfall > avg_qty:
+                    # Need more than typical order, use max_per_order
+                    qty_to_order = max_per_order
+                else:
+                    # Order the typical amount (rounded to whole units)
+                    qty_to_order = max(1, round(avg_qty))
+
+                # Cap at max_per_order
+                qty_to_order = min(max_per_order, qty_to_order)
+
                 order["items"].append({
                     "product": product,
                     "qty": qty_to_order,
@@ -576,9 +644,9 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
         min(80, max((len(p[0]) for p in all_products), default=0) + 2)
     )
 
-    print(f"\n{'Product':<{stock_col_width}} | {'Stock':<6} | {'Days':<8} | {'$/unit':<7} | {'Note'}")
-    print("-" * (stock_col_width + 36))
-    for product, stats in all_products[:25]:  # Show top 25
+    print(f"\n{'Product':<{stock_col_width}} | {'Stock':<6} | {'Days':<8} | {'Avg/wk':<7} | {'Avg/ord':<7} | {'$/unit':<7} | {'Note'}")
+    print("-" * (stock_col_width + 58))
+    for product, stats in all_products[:40]:  # Show top 40
         days_left = stats["days_until_empty"]
         if days_left == float('inf'):
             days_str = "N/A"
@@ -586,22 +654,77 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
             days_str = f"{days_left:.1f}"
 
         # Status note
+        notes = []
         if days_left < 2:
-            note = "URGENT!"
+            notes.append("URGENT!")
         elif days_left < 7:
-            note = "Low"
+            notes.append("Low")
         elif stats.get("has_promos"):
-            note = "Promo"
-        else:
-            note = ""
+            notes.append("Promo")
+
+        # Add marker if using actual stock
+        if stats.get("stock_source") == "actual":
+            notes.append("✓actual")
+
+        note = ", ".join(notes) if notes else ""
 
         print(
             f"{product:<{stock_col_width}} | "
             f"{stats['estimated_stock']:<6.1f} | "
             f"{days_str:<8} | "
+            f"{stats['weekly_need']:<7.2f} | "
+            f"{stats['avg_qty_per_order']:<7.2f} | "
             f"${stats['unit_price']:<6.2f} | "
             f"{note}"
         )
+
+    # Print promotional item tracking summary
+    print(f"\n{'='*80}")
+    print("PROMOTIONAL ITEM TRACKING - BUY ON THESE DATES")
+    print(f"{'='*80}")
+
+    # Collect all promotional items that appear in orders
+    promo_items_in_orders = {}
+    for order in orders:
+        if order.get("skipped") or not order["items"]:
+            continue
+        for item in order["items"]:
+            product = item["product"]
+            pstats = product_stats.get(product, {})
+            if pstats.get("has_promos"):
+                if product not in promo_items_in_orders:
+                    promo_items_in_orders[product] = {
+                        "dates": [],
+                        "best_days": pstats.get("best_days", []),
+                        "min_price": pstats.get("min_price", 0),
+                        "current_price": pstats.get("unit_price", 0),
+                        "savings": pstats.get("max_price", 0) - pstats.get("min_price", 0)
+                    }
+                promo_items_in_orders[product]["dates"].append(order["date"])
+
+    if promo_items_in_orders:
+        print(f"\nItems with promotional patterns (buy when on sale for best value):")
+        print(f"\n{'Product':<50} | {'Order Dates':<30} | {'Best Days':<15} | {'Save'}")
+        print("-" * 115)
+
+        for product, info in sorted(promo_items_in_orders.items(), key=lambda x: -x[1]["savings"]):
+            dates_str = ", ".join([d.strftime("%b %d") for d in info["dates"][:3]])
+            if len(info["dates"]) > 3:
+                dates_str += f" +{len(info['dates'])-3} more"
+            best_days_str = ", ".join(info["best_days"][:2]) if info["best_days"] else "N/A"
+
+            # Check if current price is at minimum
+            on_sale_now = " (ON SALE NOW!)" if info["current_price"] <= info["min_price"] else ""
+
+            print(
+                f"{product:<50} | "
+                f"{dates_str:<30} | "
+                f"{best_days_str:<15} | "
+                f"${info['savings']:.2f}{on_sale_now}"
+            )
+
+        print(f"\nTip: Stock up on promotional items when they're at their lowest price!")
+        print(f"     Historical data shows best discounts typically on: {', '.join(BEST_DISCOUNT_DAYS)}")
 
     # Print order schedule
     print(f"\n{'='*80}")
@@ -679,6 +802,14 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
                     f"{', '.join(notes)}"
                 )
 
+            # Add reorder prompt
+            print(f"\n  Reorder via https://www.coles.com.au")
+            print(f"  these items:")
+            for item in sorted(order["items"], key=lambda x: -x["total_price"]):
+                # Remove % prefix if present (indicates promotional/special item)
+                product_name = item['product'].lstrip('%')
+                print(f"  {product_name} x{item['qty']}")
+
         total_spend += week_total
         if week_total > 0:
             print(f"\n  Week {week + 1} total: ${week_total:.2f}")
@@ -704,6 +835,9 @@ def predict_two_dollar_delivery_orders():
         print("Could not determine last invoice date.")
         return
 
+    # Load in-stock data
+    in_stock_dict, stock_date = load_in_stock()
+
     # Analyze price patterns to detect promotions
     promo_info = analyze_price_patterns(price_history)
     promo_count = sum(1 for p in promo_info.values() if p.get("has_promos", False))
@@ -717,7 +851,7 @@ def predict_two_dollar_delivery_orders():
         print(f"Last invoice is over {PREDICTION_WINDOW_DAYS} days old; no forward window to plan.")
         return
 
-    product_stats = compute_product_stats(df_grouped, product_prices, last_invoice_date, prediction_start, promo_info)
+    product_stats = compute_product_stats(df_grouped, product_prices, last_invoice_date, prediction_start, promo_info, in_stock_dict, stock_date)
     if not product_stats:
         print("No products with measurable demand.")
         return
