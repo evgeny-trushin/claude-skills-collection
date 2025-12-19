@@ -1,35 +1,83 @@
-# Coles order prediction toolkit
+# Coles Order Prediction Toolkit
 
-Toolkit for redacting Coles invoices, extracting purchase history, forecasting future orders, and running the conversation-first Claude skill with guides and screenshots.
+Automated pipeline for redacting Coles invoices, extracting purchase history, and predicting optimal reorder dates with $2 delivery windows.
 
-What’s here
-- `01-redact/` redacts PDFs using `redact_pdf.py`; `redact_pdf.sh` builds a local venv and installs pinned `requirements.txt` so redactions stay consistent. Outputs to `input_invoices_redacted/`.
-- `02-predict/` local pipeline: `01_convert.py` (PDF → Markdown), `02_obfuscate.py` (string replacements), `03_extract_data.py` (structured JSON to `output_extracted/extracted_data.json`), `04_predict_orders.py` (Prophet forecasting). Shell runners: `01_convert.sh`, `02_predict-orders.sh`. Dependencies pinned in `requirements.txt`.
-- `03-coles-invoice-processor-claude-skill/` conversation-only Claude skill (no local paths). `SKILL.md` gives in-chat instructions; `reference.md` documents patterns and the prediction algorithm. Package with `03-coles-invoice-processor-claude-skill/zip_skill.sh` (outputs `coles-invoice-processor-claude-skill.zip` at repo root).
-- Guides and assets: step PNGs (`01-get-invoices...` → `07-reorder...`), `Coles-Order-Prediction-Guide.pdf`, and `create-presentation.*` live in `04-pdf-presenation/`.
+## Quick Start
 
-Processing logic
-- Redaction: string mappings from `obfuscate.online.json` plus regex-based redactions (store numbers, emails, card hints, ABN-style IDs, delivery address details) applied via PyMuPDF annotations.
-- Conversion/obfuscation: PDFs converted to Markdown (pymupdf4llm) then sensitive tokens replaced using the same mapping for safer downstream parsing.
-- Extraction: Markdown parsed into categories/items with quantities, prices, and dates, saved to `output_extracted/extracted_data.json`.
-- Prediction: Prophet infers intervals and quantities per product, forecasts forward, groups nearby orders into bulk suggestions, and reports monthly budgets.
-- Claude skill: analyzes invoices supplied in-chat (uploads or pasted text) using the same extraction/prediction logic described in `reference.md`, with outputs formatted per `SKILL.md`.
+Run the complete pipeline:
+```bash
+./run.sh
+```
 
-Visual flow
-- Step 1 (Comet or Atlas Browser): prompt “Open each invoice on https://www.coles.com.au/account/orders?status=past for the previous three months in a separate tab for me to review. Press [View Orders], then open [Download Invoice] in a separate tab.”  
-  ![Step 1: open invoices](04-pdf-presenation/01-get-invoices-via-Comet-or-Atlas.png)  
-  ![Step 1: save invoices](04-pdf-presenation/02-save-invoices.png)
-- Step 2: Upload the Coles Order Prediction skill at https://claude.ai/settings/capabilities  
-  ![Step 2: upload skill](04-pdf-presenation/03-upload-claude-skill.png)
-- Step 3: At https://claude.ai prompt “Predict Coles orders from December 2025 to March 2026.”  
-  ![Step 3: predict orders](04-pdf-presenation/04-predict-your-orders.png)  
-  ![Step 3: in progress](04-pdf-presenation/05-predict-your-orders-wip.png)  
-  ![Step 3: results](04-pdf-presenation/06-predict-your-orders-result.png)
-- Step 4 (Comet or Atlas Browser): reorder via https://www.coles.com.au using the predicted items.  
-  ![Step 4: reorder](04-pdf-presenation/07-reorder-via-Comet-or-Atlas.png)
+This single command:
+1. Shows latest invoice date and prompts you to download new invoices
+2. Redacts sensitive data from PDFs
+3. Converts invoices to structured data
+4. Predicts next $2 delivery order windows
 
-Commands
-- Redact PDFs: `cd 01-redact && ./redact_pdf.sh`
-- Local forecast pipeline: `cd 02-predict && ./01_convert.sh` then `./02_predict-orders.sh`
-- Package the Claude skill: `./03-coles-invoice-processor-claude-skill/zip_skill.sh`
-- Regenerate PDF guide: `cd 04-pdf-presenation && ./create-presentation.sh`
+## Directory Structure
+
+### `01-redact/`
+Redacts sensitive data from invoice PDFs
+- **Input:** `input_invoices/*.pdf` (raw downloads from Coles)
+- **Output:** `input_invoices_redacted/*.pdf` (anonymized)
+- **Scripts:**
+  - `redact_pdf.sh` - Creates venv, installs dependencies, runs redaction
+  - `redact_pdf.py` - Applies regex-based redactions (emails, addresses, card numbers)
+  - `copy-invoices.sh` - Copies redacted PDFs to `02-predict/`
+
+### `02-predict/`
+Converts, extracts, and predicts future orders
+- **Pipeline:**
+  1. `00_get_invoices.sh` - Shows latest invoice date, opens input folder
+  2. `01_convert.sh` - PDF → Markdown → obfuscated text → JSON extraction
+  3. `05_predict_two_dollars_delivery_order.sh` - Forecasts next $2 delivery windows
+- **Key Files:**
+  - `output_extracted/extracted_data.json` - Structured purchase history
+  - `output_extracted/in-stock.json` - Current stock levels
+  - `05_predict_two_dollars_delivery_order.py` - Prophet-based forecasting with 30-day planning window
+
+### `03-coles-invoice-processor-claude-skill/`
+Claude skill for conversational invoice analysis
+- Upload `coles-invoice-processor-claude-skill.zip` to https://claude.ai/settings/capabilities
+- Enables chat-based predictions without local installation
+
+### `04-pdf-presenation/`
+User guide with screenshots and PDF generation scripts
+
+## Processing Pipeline
+
+```
+Download → Redact → Convert → Extract → Predict
+```
+
+**Redaction:** Removes store numbers, emails, card hints, addresses using PyMuPDF
+**Conversion:** PDF → Markdown (pymupdf4llm) → obfuscated text
+**Extraction:** Parses categories, items, quantities, prices, dates into JSON
+**Prediction:** Prophet forecasts purchase intervals, groups orders into $2 delivery windows
+
+## Key Features
+
+- **Automated Invoice Download Prompts:** Checks latest invoice and guides new downloads
+- **Privacy-First:** Redacts all sensitive data before processing
+- **Smart Forecasting:** 30-day planning window with promotional item analysis
+- **Stock Management:** Tracks in-stock items to prevent duplicate orders
+- **Delivery Optimization:** Groups predictions into $2 minimum delivery windows
+
+## Commands
+
+```bash
+# Full pipeline (recommended)
+./run.sh
+
+# Individual steps
+cd 01-redact && ./redact_pdf.sh
+cd 02-predict && ./01_convert.sh
+cd 02-predict && ./05_predict_two_dollars_delivery_order.sh
+
+# Package Claude skill
+./03-coles-invoice-processor-claude-skill/zip_skill.sh
+
+# Regenerate guide
+cd 04-pdf-presenation && ./create-presentation.sh
+```
