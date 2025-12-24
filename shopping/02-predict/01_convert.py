@@ -13,23 +13,36 @@ def convert_pdfs_to_markdown():
 
     print(f"Found {len(files)} PDF files. Starting conversion...")
 
+    skipped = 0
+    converted = 0
+
     for pdf_file in files:
         try:
             md_filename = os.path.splitext(pdf_file)[0] + ".md"
             pdf_path = os.path.join(INPUT_DIR, pdf_file)
             md_path = os.path.join(INPUT_DIR, md_filename)
+
+            # Skip if markdown file already exists
+            if os.path.exists(md_path):
+                print(f"Skipping '{pdf_file}' - '{md_filename}' already exists")
+                skipped += 1
+                continue
+
             print(f"Converting '{pdf_file}' to '{md_filename}'...")
-            
+
             # Convert PDF to Markdown
             md_text = pymupdf4llm.to_markdown(pdf_path)
-            
+
             # Write to file
             with open(md_path, 'w', encoding='utf-8') as f:
                 f.write(md_text)
-                
+
             print(f"Successfully converted '{pdf_file}'")
+            converted += 1
         except Exception as e:
             print(f"Failed to convert '{pdf_file}': {e}")
+
+    print(f"\nSummary: {converted} converted, {skipped} skipped (already exist)")
 
 if __name__ == "__main__":
     convert_pdfs_to_markdown()
