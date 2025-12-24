@@ -316,160 +316,280 @@ def analyze_price_patterns(price_history):
     return promo_info
 
 
-def compute_product_stats(df_grouped, product_prices, last_invoice_date, prediction_start, promo_info=None, in_stock_dict=None, stock_date=None, generic_mappings=None):
+def calculate_consumption_metrics(df, oldest_invoice_date):
+    """
+    Calculate consumption metrics for a dataset (single product or group).
+    df: DataFrame with 'ds' (date) and 'y' (quantity) columns.
+    Returns: daily_rate, avg_interval, avg_qty_per_order, last_date, last_order_qty, total_qty, order_count
+    """
+    # Ensure sorted
+    df = df.sort_values("ds")
+    
+    total_qty = df["y"].sum()
+    order_count = len(df)
+    
+    if order_count == 0:
+        return 0, 0, 0, None, 0, 0, 0
+
+    first_date = df["ds"].min()
+    last_date = df["ds"].max()
+    
+    # Last order qty (sum of all items on the last date)
+    last_order_qty = df[df["ds"] == last_date]["y"].sum()
+
+    avg_qty_per_order = total_qty / order_count
+    
+    # Calculate intervals
+    avg_interval = None
+    if order_count > 1:
+        # Calculate days between orders
+        # Note: If multiple rows have same date, diff() gives 0, which is correct for "same day" orders
+        # but we might want unique dates for interval calculation
+        unique_dates = sorted(df["ds"].unique())
+        if len(unique_dates) > 1:
+            intervals = pd.Series(unique_dates).diff().dt.days.dropna()
+            avg_interval = intervals.mean()
+
+    # Daily Rate Logic
+    daily_rate = 0
+    if order_count >= 2:
+        # Multiple orders: calculate from first order to last order
+        total_period = (last_date - first_date).days
+        if total_period > 0:
+            daily_rate = total_qty / total_period
+        elif avg_interval and avg_interval > 0:
+            daily_rate = avg_qty_per_order / avg_interval
+        else:
+            daily_rate = avg_qty_per_order / 7  # Default to weekly
+    else:
+        # Single order: consumption period is from oldest invoice to this order
+        total_period = (last_date - oldest_invoice_date).days
+        if total_period > 0:
+            daily_rate = total_qty / total_period
+        else:
+            # Order is on the oldest invoice date - default to weekly consumption
+            daily_rate = total_qty / 7
+            
+    return daily_rate, avg_interval, avg_qty_per_order, last_date, last_order_qty, total_qty, order_count
+
+
+def compute_product_stats(df_grouped, product_prices, last_invoice_date, prediction_start, promo_info=None, in_stock_dict=None, stock_date=None, generic_mappings=None, dont_order_set=None):
     """Calculate daily consumption and estimate current stock levels.
 
-    CONSUMPTION CALCULATION LOGIC:
-    ================================
-    - Consumption window = period between ordering two consecutive same products
-    - If ordered only once = time between the oldest invoice and that order
-    - Average consumption = total quantity / total time period from oldest invoice to last order
-
-    For stock estimation:
-    - If in-stock data provided: use actual stock from in-stock.json
-    - Otherwise: last_order_qty - (daily_rate × days_since_last_order)
-
-    GENERIC PRODUCT GROUPS:
-    - Products in the same generic group share consumption tracking
-    - Uses the most recent order date from any product in the group
+    Improved Logic:
+    - Aggregates "Generic Product Groups" first to calculate pooled consumption and stock.
+    - Selects a "Representative" product for the group (prioritizing items on sale).
+    - Prevents "0 stock" bugs where switching brands caused the system to think you were out.
     """
     stats = {}
     promo_info = promo_info or {}
     in_stock_dict = in_stock_dict or {}
     generic_mappings = generic_mappings or {}
+    dont_order_set = dont_order_set or set()
 
-    # Find the oldest invoice date across all products
+    # Find the oldest invoice date across all products (global baseline)
     oldest_invoice_date = df_grouped["ds"].min()
 
-    # Pre-calculate last order date for each generic group
-    generic_last_dates = {}
-    for product in df_grouped["product"].unique():
-        product_df = df_grouped[df_grouped["product"] == product]
-        last_date = product_df["ds"].max()
-        generic_name = find_generic_product(product, generic_mappings)
-        if generic_name:
-            if generic_name not in generic_last_dates or last_date > generic_last_dates[generic_name]:
-                generic_last_dates[generic_name] = last_date
+    # Map products to their groups
+    product_to_group = {}
+    for g_name, p_list in generic_mappings.items():
+        for p in p_list:
+            product_to_group[p] = g_name
 
-    # Track which generic groups have been processed
-    processed_generic_groups = set()
+    processed_products = set()
 
-    for product in df_grouped["product"].unique():
-        # Skip if this product's generic group has already been processed
-        generic_name = find_generic_product(product, generic_mappings)
-        if generic_name and generic_name in processed_generic_groups:
-            continue
-        product_df = df_grouped[df_grouped["product"] == product].sort_values("ds")
-        total_qty = product_df["y"].sum()
-        if total_qty <= 0:
+    # =========================================================
+    # 1. PROCESS GENERIC GROUPS
+    # =========================================================
+    for group_name, group_products in generic_mappings.items():
+        # Get data for all products in this group
+        # Filter df_grouped for products in this group
+        group_df = df_grouped[df_grouped["product"].isin(group_products)].copy()
+        
+        if group_df.empty:
             continue
 
-        # Skip free/promotional items
-        unit_price = product_prices.get(product, {}).get("price", 0.0)
-        if unit_price == 0:
+        # Mark these products as processed
+        processed_products.update(group_df["product"].unique())
+
+        # Aggregate data: Group by Date only (summing quantities across different brands/types)
+        # We create a "Virtual Product" history for the group
+        group_daily_df = group_df.groupby("ds")["y"].sum().reset_index()
+
+        # Calculate metrics for the GROUP
+        daily_rate, avg_interval, avg_qty_per_order, last_date, last_order_qty, total_qty, order_count = \
+            calculate_consumption_metrics(group_daily_df, oldest_invoice_date)
+
+        if total_qty <= 0 or daily_rate <= 0:
             continue
 
-        first_date = product_df["ds"].min()
-        product_last_date = product_df["ds"].max()
-        order_count = len(product_df)
-
-        # Use generic group's last order date if available
-        if generic_name and generic_name in generic_last_dates:
-            last_date = generic_last_dates[generic_name]
-            if last_date > product_last_date:
-                print(cyan(f"  Using generic group '{generic_name}' last date: {last_date.strftime('%Y-%m-%d')} (instead of {product_last_date.strftime('%Y-%m-%d')})"))
-        else:
-            last_date = product_last_date
-
-        # Mark this generic group as processed
-        if generic_name:
-            processed_generic_groups.add(generic_name)
-
-        # Calculate order frequency - how often this product appears in orders
-        product_df = product_df.copy()
-        product_df["interval"] = product_df["ds"].diff().dt.days
-        avg_interval = product_df["interval"].mean()
-
-        # Only consider items ordered at least twice, or ordered recently (within last 30 days)
-        days_since_last_order = (prediction_start - last_date).days
-        if order_count < 2 and days_since_last_order > 30:
-            continue  # Skip one-time purchases that are old
-
-        # =========================================================
-        # CONSUMPTION RATE CALCULATION
-        # =========================================================
-        # Consumption period is from the oldest invoice to the last order of this product
-        # This gives us the total time period over which consumption occurred
-
-        avg_qty_per_order = total_qty / order_count
-
-        if order_count >= 2:
-            # Multiple orders: calculate from first order to last order of this product
-            total_consumption_period = (last_date - first_date).days
-            if total_consumption_period > 0:
-                daily_rate = total_qty / total_consumption_period
-            else:
-                # Orders on same day - use avg interval from differences
-                if avg_interval and not pd.isna(avg_interval) and avg_interval > 0:
-                    daily_rate = avg_qty_per_order / avg_interval
-                else:
-                    daily_rate = avg_qty_per_order / 7  # Default to weekly
-        else:
-            # Single order: consumption period is from oldest invoice to this order
-            total_consumption_period = (last_date - oldest_invoice_date).days
-            if total_consumption_period > 0:
-                daily_rate = total_qty / total_consumption_period
-            else:
-                # Order is on the oldest invoice date - default to weekly consumption
-                daily_rate = total_qty / 7
-
+        # Determine if frequent
         weekly_need = daily_rate * 7
-
-        # Determine if this is a frequently ordered item
         frequent = False
-        if order_count >= 3 and avg_interval is not None and not pd.isna(avg_interval) and avg_interval <= 14:
+        if order_count >= 3 and avg_interval is not None and avg_interval <= 14:
             frequent = True
-        elif weekly_need >= 0.5:  # Need at least half unit per week
+        elif weekly_need >= 0.5:
             frequent = True
 
-        # Calculate max_per_order based on actual ordering behavior
-        # Use the average quantity per order as the baseline, rounded up
-        max_per_order = max(1, math.ceil(avg_qty_per_order))
+        # Calculate Group Actual Stock (Sum of all matches)
+        actual_stock = 0
+        has_actual_stock = False
+        for p in group_products:
+            qty = match_product_to_stock(p, in_stock_dict)
+            if qty is not None:
+                actual_stock += qty
+                has_actual_stock = True
 
-        # Get promo info for this product
-        pinfo = promo_info.get(product, {})
-        has_promos = pinfo.get("has_promos", False)
-        promo_stock_up = pinfo.get("promo_stock_up", max_per_order)
-
-        # If product has price promotions, increase max_per_order to allow bulk buying on sale
-        if has_promos:
-            max_per_order = max(max_per_order, promo_stock_up)
-
-        # Get the last order quantity for this product
-        last_order_qty = product_df[product_df["ds"] == last_date]["y"].sum() if not product_df.empty else 0
-
-        # =========================================================
-        # STOCK ESTIMATION
-        # =========================================================
-        # Priority 1: Use actual stock from in-stock.json if available
-        # Priority 2: Estimate based on last order depletion model
-
-        actual_stock = match_product_to_stock(product, in_stock_dict)
+        # Estimate Stock
         stock_source = "estimated"
-
-        if actual_stock is not None and stock_date:
-            # Use actual stock from in-stock.json
-            # Calculate consumption from stock_date to prediction_start
+        if has_actual_stock and stock_date:
             days_since_stock_date = (prediction_start - stock_date).days
             consumed_since_stock_date = daily_rate * days_since_stock_date
             estimated_stock = max(0, actual_stock - consumed_since_stock_date)
             stock_source = "actual"
         else:
-            # Estimate based on last order depletion model
+            days_since_last_order = (prediction_start - last_date).days
+            consumed_since_last = daily_rate * days_since_last_order
+            estimated_stock = max(0, last_order_qty - consumed_since_last)
+            
+        days_until_empty = estimated_stock / daily_rate if daily_rate > 0 else float('inf')
+
+        # SELECT REPRESENTATIVE PRODUCT
+        # We need to choose which specific product to put on the shopping list.
+        # Criteria:
+        # 1. Not in 'dont_order_set' (Strong preference)
+        # 2. Currently ON SALE (Best value)
+        # 3. Has Promos (Good habit)
+        # 4. Most frequently bought (Habit)
+
+        candidates = [p for p in group_products if p in product_prices]
+        if not candidates:
+             # Fallback to any product in the group data
+             candidates = group_df["product"].unique()
+
+        best_candidate = candidates[0]
+        best_score = -float('inf')
+
+        for p in candidates:
+            score = 0
+            pinfo = promo_info.get(p, {})
+            current_price = product_prices.get(p, {}).get("price", 0)
+            
+            # Penalize blocked items heavily
+            if is_product_blocked(p, dont_order_set, generic_mappings):
+                score -= 10000
+
+            # Bonus for being on sale NOW
+            min_price = pinfo.get("min_price", 0)
+            if pinfo.get("has_promos") and current_price <= min_price * 1.05 and current_price > 0:
+                score += 500
+            
+            # Bonus for having promo patterns generally
+            if pinfo.get("has_promos"):
+                score += 50
+
+            # Bonus for frequency (count of rows in original df for this specific product)
+            p_rows = len(group_df[group_df["product"] == p])
+            score += p_rows
+
+            if score > best_score:
+                best_score = score
+                best_candidate = p
+
+        representative = best_candidate
+        
+        # Get unit price of the representative
+        unit_price = product_prices.get(representative, {}).get("price", 0)
+        
+        # Max per order: heuristic based on group behavior
+        max_per_order = max(1, math.ceil(avg_qty_per_order))
+        rep_pinfo = promo_info.get(representative, {})
+        if rep_pinfo.get("has_promos"):
+            max_per_order = max(max_per_order, rep_pinfo.get("promo_stock_up", max_per_order))
+
+        stats[representative] = {
+            "daily_rate": daily_rate,
+            "weekly_need": weekly_need,
+            "avg_interval": avg_interval,
+            "avg_qty_per_order": avg_qty_per_order,
+            "frequent": frequent,
+            "max_per_order": max_per_order,
+            "unit_price": unit_price,
+            "estimated_stock": estimated_stock,
+            "days_until_empty": days_until_empty,
+            "order_count": order_count,
+            "last_order_date": last_date,
+            "last_order_qty": last_order_qty,
+            "days_since_last_order": (prediction_start - last_date).days,
+            "stock_source": stock_source,
+            "is_group_representative": True,
+            "group_name": group_name,
+            # Promo info (from Representative)
+            "has_promos": rep_pinfo.get("has_promos", False),
+            "min_price": rep_pinfo.get("min_price", unit_price),
+            "max_price": rep_pinfo.get("max_price", unit_price),
+            "avg_price": rep_pinfo.get("avg_price", unit_price),
+            "price_variance_pct": rep_pinfo.get("price_variance_pct", 0),
+            "promo_stock_up": rep_pinfo.get("promo_stock_up", max_per_order),
+            "savings_pct": rep_pinfo.get("savings_pct", 0),
+            "best_days": rep_pinfo.get("best_days", []),
+            "best_weeks": rep_pinfo.get("best_weeks", []),
+        }
+
+    # =========================================================
+    # 2. PROCESS INDIVIDUAL PRODUCTS
+    # =========================================================
+    for product in df_grouped["product"].unique():
+        if product in processed_products:
+            continue
+            
+        # Standard individual processing
+        product_df = df_grouped[df_grouped["product"] == product]
+        
+        # Calculate consumption metrics
+        daily_rate, avg_interval, avg_qty_per_order, last_date, last_order_qty, total_qty, order_count = \
+            calculate_consumption_metrics(product_df, oldest_invoice_date)
+            
+        if total_qty <= 0: continue
+
+        # Skip free/promotional items (price 0)
+        unit_price = product_prices.get(product, {}).get("price", 0.0)
+        if unit_price == 0:
+            continue
+            
+        # Skip old one-time purchases
+        days_since_last_order = (prediction_start - last_date).days
+        if order_count < 2 and days_since_last_order > 30:
+            continue
+
+        weekly_need = daily_rate * 7
+        
+        frequent = False
+        if order_count >= 3 and avg_interval is not None and avg_interval <= 14:
+            frequent = True
+        elif weekly_need >= 0.5:
+            frequent = True
+
+        max_per_order = max(1, math.ceil(avg_qty_per_order))
+        pinfo = promo_info.get(product, {})
+        has_promos = pinfo.get("has_promos", False)
+        promo_stock_up = pinfo.get("promo_stock_up", max_per_order)
+        if has_promos:
+            max_per_order = max(max_per_order, promo_stock_up)
+
+        # Stock Estimation
+        actual_stock = match_product_to_stock(product, in_stock_dict)
+        stock_source = "estimated"
+        
+        if actual_stock is not None and stock_date:
+            days_since_stock_date = (prediction_start - stock_date).days
+            consumed_since_stock_date = daily_rate * days_since_stock_date
+            estimated_stock = max(0, actual_stock - consumed_since_stock_date)
+            stock_source = "actual"
+        else:
             consumed_since_last = daily_rate * days_since_last_order
             estimated_stock = max(0, last_order_qty - consumed_since_last)
 
-        # Days until stock runs out
         days_until_empty = estimated_stock / daily_rate if daily_rate > 0 else float('inf')
 
         stats[product] = {
@@ -486,8 +606,7 @@ def compute_product_stats(df_grouped, product_prices, last_invoice_date, predict
             "last_order_date": last_date,
             "last_order_qty": last_order_qty,
             "days_since_last_order": days_since_last_order,
-            "stock_source": stock_source,  # "actual" or "estimated"
-            # Promo info
+            "stock_source": stock_source,
             "has_promos": has_promos,
             "min_price": pinfo.get("min_price", unit_price),
             "max_price": pinfo.get("max_price", unit_price),
@@ -700,30 +819,63 @@ def consolidate_duplicate_products(orders, product_stats):
 
 
 def consolidate_small_orders(orders):
-    """Merge orders that are too small into adjacent orders to meet minimums."""
-    # Skip orders with no items
-    valid_orders = [o for o in orders if o["items"]]
-
-    # If an order doesn't meet minimum, try to merge with next order
-    i = 0
-    while i < len(valid_orders) - 1:
-        if not valid_orders[i]["meets_minimum"]:
-            # Merge into next order
-            next_order = valid_orders[i + 1]
-            for item in valid_orders[i]["items"]:
-                # Check if product already in next order
-                existing = next((x for x in next_order["items"] if x["product"] == item["product"]), None)
-                if existing:
-                    existing["qty"] += item["qty"]
-                    existing["total_price"] = existing["qty"] * existing["unit_price"]
-                else:
-                    next_order["items"].append(item)
-            next_order["notes"].append(f"Merged from {valid_orders[i]['date'].strftime('%Y-%m-%d')}")
-            valid_orders[i]["items"] = []
-            valid_orders[i]["items_total"] = 0
-            valid_orders[i]["total_with_delivery"] = 0
-            valid_orders[i]["skipped"] = True
-        i += 1
+    """
+    Aggressively merge orders that don't meet the minimum threshold.
+    Strategy:
+    1. Try to merge FORWARD (into the next order).
+    2. If no next order (end of list), merge BACKWARD (into previous order).
+    Repeat until all valid orders meet minimum or no merges are possible.
+    """
+    changed = True
+    while changed:
+        changed = False
+        # Get indices of currently valid orders
+        active_indices = [i for i, o in enumerate(orders) if o["items"] and not o.get("skipped")]
+        
+        for idx_in_active, i in enumerate(active_indices):
+            order = orders[i]
+            
+            # Recalculate totals to ensure status is current
+            items_total = sum(item["total_price"] for item in order["items"])
+            order["items_total"] = items_total
+            order["meets_minimum"] = items_total >= MIN_ORDER_TOTAL
+            
+            if not order["meets_minimum"]:
+                target_idx = None
+                direction = ""
+                
+                # 1. Try Merging Forward
+                if idx_in_active < len(active_indices) - 1:
+                    target_idx = active_indices[idx_in_active + 1]
+                    direction = "forward"
+                # 2. Try Merging Backward (only if forward not possible)
+                elif idx_in_active > 0:
+                    target_idx = active_indices[idx_in_active - 1]
+                    direction = "backward"
+                
+                if target_idx is not None:
+                    target_order = orders[target_idx]
+                    
+                    # Move items
+                    for item in order["items"]:
+                        existing = next((x for x in target_order["items"] if x["product"] == item["product"]), None)
+                        if existing:
+                            existing["qty"] += item["qty"]
+                            existing["total_price"] = existing["qty"] * existing["unit_price"]
+                        else:
+                            target_order["items"].append(item)
+                    
+                    target_order["notes"].append(f"Merged {direction} from {order['date'].strftime('%Y-%m-%d')}")
+                    
+                    # Clear current order
+                    order["items"] = []
+                    order["items_total"] = 0
+                    order["total_with_delivery"] = 0
+                    order["skipped"] = True
+                    
+                    # Restart loop since indices changed
+                    changed = True
+                    break
 
     return orders
 
@@ -1039,7 +1191,7 @@ def predict_two_dollar_delivery_orders():
         print(f"Last invoice is over {PREDICTION_WINDOW_DAYS} days old; no forward window to plan.")
         return
 
-    product_stats = compute_product_stats(df_grouped, product_prices, last_invoice_date, prediction_start, promo_info, in_stock_dict, stock_date, generic_mappings)
+    product_stats = compute_product_stats(df_grouped, product_prices, last_invoice_date, prediction_start, promo_info, in_stock_dict, stock_date, generic_mappings, dont_order)
     if not product_stats:
         print(red("No products with measurable demand."))
         return
