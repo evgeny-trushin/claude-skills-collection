@@ -1,0 +1,137 @@
+{
+  "description": "Maps specific products to generic product groups for stock calculation. When a specific product is not in stock, the system uses the generic product to calculate virtual stock based on average consumption.",
+  "mappings": {
+    "Coles Free Range Eggs": [
+      "Coles Free Range Eggs 12 Pack 600g",
+      "Coles Free Range Eggs 12 Pack 700g",
+      "Coles Cage Free Eggs 12 Pack 700g",
+      "Sunny Queen Free Range Large Eggs 18 Pack 900g"
+    ],
+    "Coles Oat Milk": [
+      "Coles Unsweetened Oat Milk 1L",
+      "Coles Organic Unsweetened Oat Milk 1L"
+    ],
+    "Coles Milk 3L": [
+      "Coles Fresh Lite Milk 3L",
+      "Coles Full Cream Milk 3L",
+      "Devondale Full Cream Milk 3L",
+      "Devondale Light Milk 3L"
+    ],
+    "Coles Broccoli": [
+      "Coles Broccoli Medium approx. 340g",
+      "Coles Broccoli approx. 340g each"
+    ],
+    "Coles Truss Tomatoes": [
+      "Coles Greenhouse Truss Tomatoes approx. 110g",
+      "Coles Greenhouse Truss Tomatoes approx. 130g",
+      "Coles Tomatoes Greenhouse Truss approx. 130g",
+      "Coles Gourmet Fresh Tomatoes Loose approx. 110g"
+    ],
+    "Coles Apples": [
+      "Coles Apples Mini 1kg 1 each",
+      "Coles I'M Perfect Apples Prepacked 2kg",
+      "Coles I'm Perfect Apples Prepacked 2kg",
+      "Coles Pink Lady Apples Medium approx. 200g each"
+    ],
+    "Coles Pears": [
+      "Coles I'M Perfect Pears Prepacked 1.5kg",
+      "Coles Packham Pears approx. 240g each"
+    ],
+    "Coles Potatoes": [
+      "Coles Potatoes Washed 2kg",
+      "Coles Red Royale Washed Potatoes 2 Kg",
+      "Coles Washed Potatoes 2kg"
+    ],
+    "Coles Rice": [
+      "Coles Brown Rice 1 kg",
+      "Coles Jasmine Rice 2kg",
+      "Coles Long Grain Rice 1kg",
+      "Coles Microwave Jasmine Rice 250g",
+      "Coles Microwave Rice Basmati 250g"
+    ],
+    "Coles Flour": [
+      "Coles White Plain Flour 2kg",
+      "Coles White Self Raising Flour 2kg",
+      "Coles Wholemeal Plain Flour 1 kg"
+    ],
+    "Coles Himalayan Salt": [
+      "Coles Himalayan Pink Salt Refill Bag 500g",
+      "Coles Pink Fine Himalayan Salt 1kg"
+    ],
+    "Coles Chicken Breast": [
+      "Coles RSPCA Approved Chicken Breast Fillets Large",
+      "Coles RSPCA Approved Free Range Chicken Breast Lar",
+      "El- Amin's Halal Chicken Breast Fillets Large Pac"
+    ],
+    "Coles Chicken Mince": [
+      "Coles RSPCA Approved Chicken Breast Mince 500g"
+    ],
+    "Coles Beef Mince": [
+      "Coles No Added Hormone Beef 3 Star Regular Mince 5",
+      "Coles No Added Hormone Beef 4 Star Lean Mince 800g"
+    ],
+    "Red Tractor Oats": [
+      "Red Tractor Creamy Style Protein Porridge Oats 750",
+      "Red Tractor Organic Steel Cut Oats 1 kg",
+      "Red Tractor Protein Instant Oats Original 750g"
+    ],
+    "Red Tractor Granola": [
+      "Red Tractor Protein Low Sugar Granola Apple Carame",
+      "Red Tractor Protein Low Sugar Granola Choc Almond",
+      "Red Tractor Protein Low Sugar Granola Peanut Butte"
+    ],
+    "Sensodyne Toothpaste": [
+      "%Sensodyne Deep Clean Toothpaste 100g",
+      "%Sensodyne Repair & Protect Cool Mint Sensitive Too",
+      "%Sensodyne Repair & Protect Sensitive Toothpaste 10"
+    ],
+    "Nature's Way Kids Vitamins": [
+      "%Nature's Way Kid Smart Vita Gummies Multi-Vitamin",
+      "%Nature's Way Kid Smart Vita Gummies Multi-vitamin"
+    ],
+    "Sorbent Toilet Paper": [
+      "%Sorbent 3 Ply Silky White Toilet Paper 24 Pack",
+      "%Sorbent 3 Ply Soft & Strong Silky White Toilet Pap",
+      "%Sorbent 3-ply Silky White Toilet Paper 45 Pack"
+    ],
+    "Mutti Pasta Sauce": [
+      "Mutti Sugo Pasta Sauce Basil & Onion 400g",
+      "Mutti Sugo Semplice Basil & Onion 400g"
+    ],
+    "St Dalfour Spread": [
+      "St Dalfour Red Raspberry Spread 284g",
+      "St Dalfour Strawberry Spread 284g"
+    ],
+    "Cleaver's Beef Hotdogs": [
+      "Cleaver's Organic Grass-Fed Beef Hotdogs Gluten F",
+      "Cleaver's Organic Grass-fed Beef Hotdogs Gluten F"
+    ],
+    "Coles Promotional Entry": [
+      "Coles Fest Peel & Win card 1 Each",
+      "Coles Shop Scan Win Entry 1 Each",
+      "Coles Shop, Scan, Win Entry 1 Each",
+      "Coles Shop, Scan, Win Entry 1 each"
+    ],
+    "Whole Earth Sweetener": [
+      "Whole Earth Monk Fruit 100% Natural Sweetener 200g",
+      "Whole Earth Sugar Raw Replacement 200g"
+    ],
+    "Coles Foaming Handwash": [
+      "%Coles Foaming Handwash Lime & Mint 1L",
+      "%Coles Foaming Handwash Raspberry 1L"
+    ],
+    "Tuna In Water": [
+      "Coles Simply Tuna In Springwater 185g",
+      "John West Tuna Chunky Style In Springwater 95g"
+    ],
+    "Tomato Products": [
+      "Ardmona Diced Tomatoes 400g",
+      "Mutti Tomato Passata with Basil 700g"
+    ],
+    "Low Carb Wraps": [
+      "Bfree Low Carb High Protein Wraps 210g",
+      "Simson's Pantry Low Carb Garlic & Herb + Protein",
+      "Simsons Pantry High Protein Low Carb Wholemeal Wra"
+    ]
+  }
+}
