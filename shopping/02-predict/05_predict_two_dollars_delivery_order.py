@@ -10,6 +10,30 @@ import pandas as pd
 logging.getLogger("cmdstanpy").setLevel(logging.ERROR)
 logging.getLogger("prophet").setLevel(logging.ERROR)
 
+# ANSI color codes
+class Colors:
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    YELLOW = '\033[93m'
+    CYAN = '\033[96m'
+    BOLD = '\033[1m'
+    RESET = '\033[0m'
+
+def green(text):
+    return f"{Colors.GREEN}{text}{Colors.RESET}"
+
+def red(text):
+    return f"{Colors.RED}{text}{Colors.RESET}"
+
+def yellow(text):
+    return f"{Colors.YELLOW}{text}{Colors.RESET}"
+
+def cyan(text):
+    return f"{Colors.CYAN}{text}{Colors.RESET}"
+
+def bold(text):
+    return f"{Colors.BOLD}{text}{Colors.RESET}"
+
 OUTPUT_DIR = "output_extracted"
 MIN_ORDER_TOTAL = 50  # Coles minimum order requirement
 DELIVERY_FEE = 2.0    # assumed flat delivery fee per order
@@ -17,7 +41,7 @@ ORDERS_PER_WEEK = 2   # optimal for catching discounts
 # Based on analysis: Tuesday (60% discount rate) and Saturday (44% discount rate)
 ORDER_DAYS = ["Tuesday", "Saturday"]  # best days for Coles discounts
 ORDER_OFFSETS = [1, 5]  # Tuesday=1, Saturday=5 (Monday=0)
-PREDICTION_WINDOW_DAYS = 30  # only plan one month ahead from last invoice
+PREDICTION_WINDOW_DAYS = 60  # plan two months ahead from last invoice
 
 # Promotional pattern insights from historical data
 BEST_DISCOUNT_DAYS = ["Tuesday", "Friday", "Saturday"]
@@ -29,7 +53,7 @@ def load_in_stock():
     """Load in-stock data from in-stock.json and return a dict with fuzzy-matched product names."""
     stock_file = os.path.join(OUTPUT_DIR, "in-stock.json")
     if not os.path.exists(stock_file):
-        print(f"Note: {stock_file} not found. Using estimated stock levels.")
+        print(yellow(f"Note: {stock_file} not found. Using estimated stock levels."))
         return {}, None
 
     try:
@@ -47,11 +71,63 @@ def load_in_stock():
             quantity = item.get("quantity", 0)
             in_stock[product_partial] = quantity
 
-        print(f"Loaded in-stock data from {stock_date.strftime('%Y-%m-%d') if stock_date else 'unknown date'}: {len(in_stock)} items")
+        print(green(f"Loaded in-stock data from {stock_date.strftime('%Y-%m-%d') if stock_date else 'unknown date'}: {len(in_stock)} items"))
         return in_stock, stock_date
     except Exception as e:
-        print(f"Warning: Error loading in-stock.json: {e}")
+        print(red(f"Warning: Error loading in-stock.json: {e}"))
         return {}, None
+
+
+def load_dont_order():
+    """Load products that should not be ordered from dont-order.json"""
+    dont_order_file = os.path.join(OUTPUT_DIR, "dont-order.json")
+    if os.path.exists(dont_order_file):
+        with open(dont_order_file, "r") as f:
+            data = json.load(f)
+            return set(data.get("items", []))
+    return set()
+
+
+def load_generic_products():
+    """Load generic product mappings"""
+    generic_file = os.path.join(OUTPUT_DIR, "generic-products.json")
+    if os.path.exists(generic_file):
+        with open(generic_file, "r") as f:
+            data = json.load(f)
+            return data.get("mappings", {})
+    return {}
+
+
+def find_generic_product(product, generic_mappings):
+    """Find the generic product name for a specific product"""
+    for generic_name, products in generic_mappings.items():
+        if product in products:
+            return generic_name
+    return None
+
+
+def is_product_blocked(product, dont_order_set, generic_mappings):
+    """Check if product or its generic group is in dont-order list"""
+    # Direct match
+    if product in dont_order_set:
+        return True
+
+    # Partial match
+    for blocked in dont_order_set:
+        if product.startswith(blocked) or blocked.startswith(product):
+            return True
+
+    # Check if any product in same generic group is blocked
+    generic_name = find_generic_product(product, generic_mappings)
+    if generic_name:
+        for p in generic_mappings[generic_name]:
+            if p in dont_order_set:
+                return True
+            for blocked in dont_order_set:
+                if p.startswith(blocked) or blocked.startswith(p):
+                    return True
+
+    return False
 
 
 def match_product_to_stock(product_name, in_stock_dict):
@@ -84,7 +160,7 @@ def match_product_to_stock(product_name, in_stock_dict):
 def load_grouped_orders():
     data_file = os.path.join(OUTPUT_DIR, "extracted_data.json")
     if not os.path.exists(data_file):
-        print(f"Error: {data_file} not found. Please run extraction first.")
+        print(red(f"Error: {data_file} not found. Please run extraction first."))
         return None, {}, None, {}
 
     with open(data_file, "r") as f:
@@ -240,7 +316,7 @@ def analyze_price_patterns(price_history):
     return promo_info
 
 
-def compute_product_stats(df_grouped, product_prices, last_invoice_date, prediction_start, promo_info=None, in_stock_dict=None, stock_date=None):
+def compute_product_stats(df_grouped, product_prices, last_invoice_date, prediction_start, promo_info=None, in_stock_dict=None, stock_date=None, generic_mappings=None):
     """Calculate daily consumption and estimate current stock levels.
 
     CONSUMPTION CALCULATION LOGIC:
@@ -252,15 +328,37 @@ def compute_product_stats(df_grouped, product_prices, last_invoice_date, predict
     For stock estimation:
     - If in-stock data provided: use actual stock from in-stock.json
     - Otherwise: last_order_qty - (daily_rate × days_since_last_order)
+
+    GENERIC PRODUCT GROUPS:
+    - Products in the same generic group share consumption tracking
+    - Uses the most recent order date from any product in the group
     """
     stats = {}
     promo_info = promo_info or {}
     in_stock_dict = in_stock_dict or {}
+    generic_mappings = generic_mappings or {}
 
     # Find the oldest invoice date across all products
     oldest_invoice_date = df_grouped["ds"].min()
 
+    # Pre-calculate last order date for each generic group
+    generic_last_dates = {}
     for product in df_grouped["product"].unique():
+        product_df = df_grouped[df_grouped["product"] == product]
+        last_date = product_df["ds"].max()
+        generic_name = find_generic_product(product, generic_mappings)
+        if generic_name:
+            if generic_name not in generic_last_dates or last_date > generic_last_dates[generic_name]:
+                generic_last_dates[generic_name] = last_date
+
+    # Track which generic groups have been processed
+    processed_generic_groups = set()
+
+    for product in df_grouped["product"].unique():
+        # Skip if this product's generic group has already been processed
+        generic_name = find_generic_product(product, generic_mappings)
+        if generic_name and generic_name in processed_generic_groups:
+            continue
         product_df = df_grouped[df_grouped["product"] == product].sort_values("ds")
         total_qty = product_df["y"].sum()
         if total_qty <= 0:
@@ -272,8 +370,20 @@ def compute_product_stats(df_grouped, product_prices, last_invoice_date, predict
             continue
 
         first_date = product_df["ds"].min()
-        last_date = product_df["ds"].max()
+        product_last_date = product_df["ds"].max()
         order_count = len(product_df)
+
+        # Use generic group's last order date if available
+        if generic_name and generic_name in generic_last_dates:
+            last_date = generic_last_dates[generic_name]
+            if last_date > product_last_date:
+                print(cyan(f"  Using generic group '{generic_name}' last date: {last_date.strftime('%Y-%m-%d')} (instead of {product_last_date.strftime('%Y-%m-%d')})"))
+        else:
+            last_date = product_last_date
+
+        # Mark this generic group as processed
+        if generic_name:
+            processed_generic_groups.add(generic_name)
 
         # Calculate order frequency - how often this product appears in orders
         product_df = product_df.copy()
@@ -462,19 +572,19 @@ def build_minimal_orders(product_stats, order_dates, start_date):
             # Only order if stock will run out before next order
             if current_stock < needed_for_period:
                 shortfall = needed_for_period - current_stock
-                # Order in the typical batch size based on historical ordering behavior
-                # This respects the user's actual ordering patterns (e.g., buying 3 pizzas at once)
-                # Use avg_qty_per_order as the default, but ensure at least the shortfall is covered
+                # Order enough to cover the shortfall AND last until the next order
+                # This prevents re-ordering the same product in consecutive orders
                 avg_qty = stats["avg_qty_per_order"]
-                if shortfall > avg_qty:
-                    # Need more than typical order, use max_per_order
-                    qty_to_order = max_per_order
-                else:
-                    # Order the typical amount (rounded to whole units)
-                    qty_to_order = max(1, round(avg_qty))
 
-                # Cap at max_per_order
-                qty_to_order = min(max_per_order, qty_to_order)
+                # Calculate minimum needed: at least cover shortfall, rounded up
+                min_needed = math.ceil(shortfall)
+
+                # Order the larger of: minimum needed OR typical order quantity
+                qty_to_order = max(min_needed, max(1, round(avg_qty)))
+
+                # Allow up to 2x historical max to cover longer periods between orders
+                effective_max = max(max_per_order, min_needed)
+                qty_to_order = min(qty_to_order, effective_max)
 
                 order["items"].append({
                     "product": product,
@@ -539,6 +649,56 @@ def enforce_minimums(orders, product_stats):
         order["meets_minimum"] = items_total >= MIN_ORDER_TOTAL
 
 
+def consolidate_duplicate_products(orders, product_stats):
+    """
+    Remove duplicate products from consecutive orders.
+    If a product appears in Order N and Order N+1, consolidate into Order N
+    with enough quantity to last until Order N+2.
+    """
+    valid_orders = [o for o in orders if o["items"] and not o.get("skipped")]
+
+    for i in range(len(valid_orders) - 1):
+        current_order = valid_orders[i]
+        next_order = valid_orders[i + 1]
+
+        # Find products that appear in both orders
+        current_products = {item["product"]: item for item in current_order["items"]}
+        products_to_remove = []
+
+        for item in next_order["items"]:
+            product = item["product"]
+            if product in current_products:
+                # Product appears in both orders - consolidate into current order
+                current_item = current_products[product]
+                stats = product_stats.get(product, {})
+                daily_rate = stats.get("daily_rate", 0)
+
+                # Calculate days until order after next
+                if i + 2 < len(valid_orders):
+                    days_to_cover = (valid_orders[i + 2]["date"] - current_order["date"]).days
+                else:
+                    days_to_cover = (next_order["date"] - current_order["date"]).days + 7
+
+                # Calculate total quantity needed
+                total_needed = math.ceil(daily_rate * days_to_cover)
+                combined_qty = current_item["qty"] + item["qty"]
+
+                # Use the larger of: combined quantity or needed quantity
+                new_qty = max(combined_qty, total_needed)
+
+                # Update current order with consolidated quantity
+                current_item["qty"] = new_qty
+                current_item["total_price"] = new_qty * current_item["unit_price"]
+
+                # Mark item for removal from next order
+                products_to_remove.append(product)
+
+        # Remove consolidated products from next order
+        next_order["items"] = [item for item in next_order["items"] if item["product"] not in products_to_remove]
+
+    return orders
+
+
 def consolidate_small_orders(orders):
     """Merge orders that are too small into adjacent orders to meet minimums."""
     # Skip orders with no items
@@ -570,12 +730,12 @@ def consolidate_small_orders(orders):
 
 def print_weekly_plan(orders, product_stats, last_invoice_date, prediction_start, horizon_end):
     if not orders:
-        print("No predicted orders found to build a weekly plan.")
+        print(red("No predicted orders found to build a weekly plan."))
         return
 
-    print(f"\n{'='*80}")
-    print(f"GROCERY ORDER PREDICTION - MINIMAL STOCK STRATEGY")
-    print(f"{'='*80}")
+    print(green(f"\n{'='*80}"))
+    print(green(bold(f"  GROCERY ORDER PREDICTION - MINIMAL STOCK STRATEGY")))
+    print(green(f"{'='*80}"))
     print(f"\nLast invoice date: {last_invoice_date.strftime('%A, %d %B %Y')}")
     print(f"Prediction starts: {prediction_start.strftime('%A, %d %B %Y')}")
     print(f"Days since last order: {(prediction_start - last_invoice_date).days}")
@@ -584,9 +744,9 @@ def print_weekly_plan(orders, product_stats, last_invoice_date, prediction_start
     print(f"Minimum order: ${MIN_ORDER_TOTAL}, Delivery fee: ${DELIVERY_FEE:.2f}")
 
     # Print PROMOTIONAL STRATEGY section
-    print(f"\n{'='*80}")
-    print("COLES PROMOTIONAL PATTERN ANALYSIS")
-    print(f"{'='*80}")
+    print(green(f"\n{'='*80}"))
+    print(green(bold("  COLES PROMOTIONAL PATTERN ANALYSIS")))
+    print(green(f"{'='*80}"))
     print(f"""
 BEST DAYS TO ORDER (based on your history):
   1. TUESDAY  - 60% discount rate (new Coles specials often start Wed)
@@ -613,9 +773,9 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
     )
 
     if promo_products:
-        print(f"{'='*80}")
-        print("PRODUCT-SPECIFIC DISCOUNT PATTERNS")
-        print(f"{'='*80}")
+        print(green(f"{'='*80}"))
+        print(green(bold("  PRODUCT-SPECIFIC DISCOUNT PATTERNS")))
+        print(green(f"{'='*80}"))
         print(f"\n{'Product':<{promo_col_width}} | {'Save':<6} | {'Min$':<6} | {'Max$':<6} | {'Best Days':<15}")
         print("-" * (promo_col_width + 45))
         for product, stats in promo_products[:15]:
@@ -630,9 +790,9 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
             )
 
     # Print product consumption summary - ALL products sorted by days until empty
-    print(f"\n{'-'*80}")
-    print("CURRENT STOCK LEVELS (sorted by urgency)")
-    print(f"{'-'*80}")
+    print(green(f"\n{'-'*80}"))
+    print(green(bold("  CURRENT STOCK LEVELS (sorted by urgency)")))
+    print(green(f"{'-'*80}"))
 
     all_products = sorted(
         product_stats.items(),
@@ -655,8 +815,10 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
 
         # Status note
         notes = []
+        is_urgent = False
         if days_left < 2:
             notes.append("URGENT!")
+            is_urgent = True
         elif days_left < 7:
             notes.append("Low")
         elif stats.get("has_promos"):
@@ -668,7 +830,7 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
 
         note = ", ".join(notes) if notes else ""
 
-        print(
+        line = (
             f"{product:<{stock_col_width}} | "
             f"{stats['estimated_stock']:<6.1f} | "
             f"{days_str:<8} | "
@@ -677,11 +839,17 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
             f"${stats['unit_price']:<6.2f} | "
             f"{note}"
         )
+        if is_urgent:
+            print(red(line))
+        elif days_left < 7:
+            print(yellow(line))
+        else:
+            print(line)
 
     # Print promotional item tracking summary
-    print(f"\n{'='*80}")
-    print("PROMOTIONAL ITEM TRACKING - BUY ON THESE DATES")
-    print(f"{'='*80}")
+    print(green(f"\n{'='*80}"))
+    print(green(bold("  PROMOTIONAL ITEM TRACKING - BUY ON THESE DATES")))
+    print(green(f"{'='*80}"))
 
     # Collect all promotional items that appear in orders
     promo_items_in_orders = {}
@@ -727,9 +895,9 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
         print(f"     Historical data shows best discounts typically on: {', '.join(BEST_DISCOUNT_DAYS)}")
 
     # Print order schedule
-    print(f"\n{'='*80}")
-    print("ORDER SCHEDULE")
-    print(f"{'='*80}")
+    print(green(f"\n{'='*80}"))
+    print(green(bold("  ORDER SCHEDULE")))
+    print(green(f"{'='*80}"))
 
     total_spend = 0
     orders_placed = 0
@@ -752,13 +920,13 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
         week_orders = orders[start:end]
         week_total = 0
 
-        print(f"\n{'─'*40}")
-        print(f"WEEK {week + 1}")
-        print(f"{'─'*40}")
+        print(green(f"\n{'─'*40}"))
+        print(green(bold(f"  WEEK {week + 1}")))
+        print(green(f"{'─'*40}"))
 
         for order in week_orders:
             if order.get("skipped") or not order["items"]:
-                print(f"\n  {order['date'].strftime('%A, %d %B %Y')}: SKIPPED (merged with next)")
+                print(yellow(f"\n  {order['date'].strftime('%A, %d %B %Y')}: SKIPPED (merged with next)"))
                 continue
 
             items_total = order.get("items_total", 0)
@@ -767,10 +935,22 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
 
             week_total += order.get("total_with_delivery", 0)
             orders_placed += 1
-            status = "OK" if order.get("meets_minimum") else "BELOW MIN"
 
-            print(f"\n  ORDER DATE: {order['date'].strftime('%A, %d %B %Y')}")
-            print(f"  Status: [{status}] | Items: ${items_total:.2f} | With delivery: ${order.get('total_with_delivery', 0):.2f}")
+            # Check if order is soon (within 3 days) - mark as critical
+            today = pd.Timestamp.now().normalize()
+            days_until = (order['date'] - today).days
+            is_urgent = days_until <= 3
+
+            if order.get("meets_minimum"):
+                status = green("[OK]")
+            else:
+                status = red("[BELOW MIN]")
+
+            if is_urgent:
+                print(red(bold(f"\n  ORDER DATE: {order['date'].strftime('%A, %d %B %Y')} (in {days_until} days!)")))
+            else:
+                print(green(f"\n  ORDER DATE: {order['date'].strftime('%A, %d %B %Y')}"))
+            print(f"  Status: {status} | Items: ${items_total:.2f} | With delivery: ${order.get('total_with_delivery', 0):.2f}")
 
             if order.get("notes"):
                 for note in order["notes"]:
@@ -814,34 +994,42 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
         if week_total > 0:
             print(f"\n  Week {week + 1} total: ${week_total:.2f}")
 
-    print(f"\n{'='*80}")
-    print("SUMMARY")
-    print(f"{'='*80}")
+    print(green(f"\n{'='*80}"))
+    print(green(bold("  SUMMARY")))
+    print(green(f"{'='*80}"))
     print(f"Total orders planned: {orders_placed}")
     print(f"Total spend (with delivery): ${total_spend:.2f}")
     print(f"Average per order: ${total_spend/orders_placed:.2f}" if orders_placed > 0 else "")
     print(f"Delivery fees: ${DELIVERY_FEE * orders_placed:.2f}")
+    print(green(f"\n{'─'*40}"))
+    print(green(bold(f"  TOTAL: ${total_spend:.2f}")))
 
 
 def predict_two_dollar_delivery_orders():
     df_grouped, product_prices, last_invoice_date, price_history = load_grouped_orders()
     if df_grouped is None:
-        print("No data found to predict.")
+        print(red("No data found to predict."))
         return
 
-    print(f"Loaded {len(df_grouped)} grouped records across {df_grouped['product'].nunique()} products.")
+    print(green(f"Loaded {len(df_grouped)} grouped records across {df_grouped['product'].nunique()} products."))
 
     if last_invoice_date is None:
-        print("Could not determine last invoice date.")
+        print(red("Could not determine last invoice date."))
         return
 
     # Load in-stock data
     in_stock_dict, stock_date = load_in_stock()
 
+    # Load dont-order list and generic products
+    dont_order = load_dont_order()
+    generic_mappings = load_generic_products()
+    print(green(f"Loaded {len(dont_order)} items in dont-order list"))
+    print(green(f"Loaded {len(generic_mappings)} generic product groups"))
+
     # Analyze price patterns to detect promotions
     promo_info = analyze_price_patterns(price_history)
     promo_count = sum(1 for p in promo_info.values() if p.get("has_promos", False))
-    print(f"Analyzed price history: {len(price_history)} products, {promo_count} with promotional patterns.")
+    print(green(f"Analyzed price history: {len(price_history)} products, {promo_count} with promotional patterns."))
 
     # Plan for one month from the last invoice date
     horizon_end = last_invoice_date + timedelta(days=PREDICTION_WINDOW_DAYS)
@@ -851,17 +1039,33 @@ def predict_two_dollar_delivery_orders():
         print(f"Last invoice is over {PREDICTION_WINDOW_DAYS} days old; no forward window to plan.")
         return
 
-    product_stats = compute_product_stats(df_grouped, product_prices, last_invoice_date, prediction_start, promo_info, in_stock_dict, stock_date)
+    product_stats = compute_product_stats(df_grouped, product_prices, last_invoice_date, prediction_start, promo_info, in_stock_dict, stock_date, generic_mappings)
     if not product_stats:
-        print("No products with measurable demand.")
+        print(red("No products with measurable demand."))
         return
+
+    # Filter out products in dont-order list
+    skipped_blocked = 0
+    filtered_stats = {}
+    for product, stats in product_stats.items():
+        if is_product_blocked(product, dont_order, generic_mappings):
+            skipped_blocked += 1
+        else:
+            filtered_stats[product] = stats
+    product_stats = filtered_stats
+    if skipped_blocked > 0:
+        print(yellow(f"Skipped {skipped_blocked} products (in dont-order list)"))
 
     order_dates = generate_order_dates(prediction_start, horizon_end)
     if not order_dates:
-        print("No order dates fall within the one-month planning window.")
+        print(yellow("No order dates fall within the one-month planning window."))
         return
     orders = build_minimal_orders(product_stats, order_dates, prediction_start)
     enforce_minimums(orders, product_stats)
+
+    # Remove duplicate products from consecutive orders
+    consolidate_duplicate_products(orders, product_stats)
+
     consolidate_small_orders(orders)
 
     # Recalculate totals after consolidation
