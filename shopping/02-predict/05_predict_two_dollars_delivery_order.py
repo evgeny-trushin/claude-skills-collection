@@ -41,7 +41,7 @@ ORDERS_PER_WEEK = 2   # optimal for catching discounts
 # Based on analysis: Tuesday (60% discount rate) and Saturday (44% discount rate)
 ORDER_DAYS = ["Tuesday", "Saturday"]  # best days for Coles discounts
 ORDER_OFFSETS = [1, 5]  # Tuesday=1, Saturday=5 (Monday=0)
-PREDICTION_WINDOW_DAYS = 60  # plan two months ahead from last invoice
+PREDICTION_WINDOW_DAYS = 21  # plan 3 weeks ahead from last invoice
 
 # Promotional pattern insights from historical data
 BEST_DISCOUNT_DAYS = ["Tuesday", "Friday", "Saturday"]
@@ -381,6 +381,13 @@ def compute_product_stats(df_grouped, product_prices, last_invoice_date, predict
     - Selects a "Representative" product for the group (prioritizing items on sale).
     - Prevents "0 stock" bugs where switching brands caused the system to think you were out.
     """
+    # DEBUG: Products to trace
+    DEBUG_PRODUCTS = [
+        "%Swisse Ultivite Women''s Multivitamin With Key Nut",
+        "Foaming",
+        "Handwash"
+    ]
+    
     stats = {}
     promo_info = promo_info or {}
     in_stock_dict = in_stock_dict or {}
@@ -542,6 +549,9 @@ def compute_product_stats(df_grouped, product_prices, last_invoice_date, predict
     for product in df_grouped["product"].unique():
         if product in processed_products:
             continue
+        
+        # DEBUG: Check if this is a target product
+        is_debug_product = any(debug.lower() in product.lower() or product.lower() in debug.lower() for debug in DEBUG_PRODUCTS)
             
         # Standard individual processing
         product_df = df_grouped[df_grouped["product"] == product]
@@ -550,16 +560,23 @@ def compute_product_stats(df_grouped, product_prices, last_invoice_date, predict
         daily_rate, avg_interval, avg_qty_per_order, last_date, last_order_qty, total_qty, order_count = \
             calculate_consumption_metrics(product_df, oldest_invoice_date)
             
-        if total_qty <= 0: continue
+        if total_qty <= 0: 
+            if is_debug_product:
+                print(red(f"DEBUG: '{product}' skipped in compute_product_stats - total_qty <= 0"))
+            continue
 
         # Skip free/promotional items (price 0)
         unit_price = product_prices.get(product, {}).get("price", 0.0)
         if unit_price == 0:
+            if is_debug_product:
+                print(red(f"DEBUG: '{product}' skipped in compute_product_stats - unit_price == 0"))
             continue
             
         # Skip old one-time purchases
         days_since_last_order = (prediction_start - last_date).days
         if order_count < 2 and days_since_last_order > 30:
+            if is_debug_product:
+                print(red(f"DEBUG: '{product}' skipped in compute_product_stats - one-time purchase >30 days old (order_count={order_count}, days_since_last={days_since_last_order})"))
             continue
 
         weekly_need = daily_rate * 7
@@ -586,9 +603,25 @@ def compute_product_stats(df_grouped, product_prices, last_invoice_date, predict
             consumed_since_stock_date = daily_rate * days_since_stock_date
             estimated_stock = max(0, actual_stock - consumed_since_stock_date)
             stock_source = "actual"
+            
+            if is_debug_product:
+                print(cyan(f"\nDEBUG: Stock calculation for '{product}':"))
+                print(f"  Actual stock (from {stock_date.strftime('%Y-%m-%d')}): {actual_stock}")
+                print(f"  Days since stock date: {days_since_stock_date}")
+                print(f"  Daily consumption rate: {daily_rate:.4f}")
+                print(f"  Consumed since stock date: {consumed_since_stock_date:.2f}")
+                print(f"  Estimated current stock: {estimated_stock:.2f}")
         else:
             consumed_since_last = daily_rate * days_since_last_order
             estimated_stock = max(0, last_order_qty - consumed_since_last)
+            
+            if is_debug_product:
+                print(cyan(f"\nDEBUG: Stock calculation for '{product}' (no actual stock data):"))
+                print(f"  Last order quantity: {last_order_qty}")
+                print(f"  Days since last order: {days_since_last_order}")
+                print(f"  Daily consumption rate: {daily_rate:.4f}")
+                print(f"  Consumed since last: {consumed_since_last:.2f}")
+                print(f"  Estimated current stock: {estimated_stock:.2f}")
 
         days_until_empty = estimated_stock / daily_rate if daily_rate > 0 else float('inf')
 
@@ -645,22 +678,88 @@ def generate_order_dates(start_date, end_date):
 
 def build_minimal_orders(product_stats, order_dates, start_date):
     """Build orders that minimize stock by ordering just-in-time based on predicted depletion."""
+    # DEBUG: Products to trace
+    DEBUG_PRODUCTS = [
+        "%Swisse Ultivite Women''s Multivitamin With Key Nut",
+        "Foaming",
+        "Handwash"
+    ]
+    
     orders = [{"date": d, "items": [], "notes": []} for d in order_dates]
+    
+    if not orders:
+        return orders
 
-    # Sort products by urgency (days until empty)
-    sorted_products = sorted(
-        product_stats.items(),
-        key=lambda x: (x[1]["days_until_empty"], -x[1]["weekly_need"])
-    )
-
-    # For each product, calculate when it will run out and schedule orders accordingly
-    for product, stats in sorted_products:
+    # Separate URGENT items (0 stock) from regular items
+    urgent_products = []
+    regular_products = []
+    
+    for product, stats in product_stats.items():
+        # URGENT: products with 0 or near-0 stock (less than 1 day supply)
+        if stats["estimated_stock"] <= 0 or stats["days_until_empty"] < 1:
+            urgent_products.append((product, stats))
+        else:
+            regular_products.append((product, stats))
+    
+    # Sort urgent by weekly need (most consumed first)
+    urgent_products.sort(key=lambda x: -x[1]["weekly_need"])
+    
+    # Add ALL urgent items to the FIRST order
+    first_order = orders[0]
+    for product, stats in urgent_products:
         daily_rate = stats["daily_rate"]
         if daily_rate <= 0:
             continue
+            
+        # For urgent items, order enough to last until second order (or longer)
+        if len(orders) > 1:
+            days_to_cover = (orders[1]["date"] - first_order["date"]).days
+        else:
+            days_to_cover = 7  # Default to 1 week if only one order
+            
+        # Calculate quantity needed
+        needed = daily_rate * days_to_cover
+        qty_to_order = max(1, math.ceil(needed))
+        
+        # Cap at historical maximum or double the average
+        max_per_order = stats["max_per_order"]
+        avg_qty = stats["avg_qty_per_order"]
+        effective_max = max(max_per_order, math.ceil(avg_qty * 2))
+        qty_to_order = min(qty_to_order, effective_max)
+        
+        unit_price = stats["unit_price"]
+        first_order["items"].append({
+            "product": product,
+            "qty": qty_to_order,
+            "unit_price": unit_price,
+            "total_price": qty_to_order * unit_price,
+            "max_per_order": max_per_order,
+            "stock_before": 0.0,
+            "need_until_next": round(needed, 1),
+            "urgent": True,
+        })
+    
+    # Sort regular products by urgency (days until empty)
+    sorted_products = sorted(
+        regular_products,
+        key=lambda x: (x[1]["days_until_empty"], -x[1]["weekly_need"])
+    )
+
+    # For each regular product, calculate when it will run out and schedule orders accordingly
+    for product, stats in sorted_products:
+        # DEBUG: Check if this is a target product
+        is_debug_product = any(debug.lower() in product.lower() or product.lower() in debug.lower() for debug in DEBUG_PRODUCTS)
+        
+        daily_rate = stats["daily_rate"]
+        if daily_rate <= 0:
+            if is_debug_product:
+                print(red(f"DEBUG: '{product}' skipped - daily_rate <= 0 ({daily_rate})"))
+            continue
 
         # Skip items with very low consumption (less than 1 unit per month)
-        if stats["weekly_need"] < 0.25:
+        if stats["weekly_need"] < 0.1:
+            if is_debug_product:
+                print(red(f"DEBUG: '{product}' skipped - weekly_need < 0.1 ({stats['weekly_need']:.3f})"))
             continue
 
         unit_price = stats["unit_price"]
@@ -670,6 +769,14 @@ def build_minimal_orders(product_stats, order_dates, start_date):
         # Track stock level as we go through order dates
         current_stock = estimated_stock
         last_order_date = start_date
+        
+        if is_debug_product:
+            print(cyan(f"\nDEBUG: Processing '{product}':"))
+            print(f"  Initial stock: {estimated_stock:.1f}")
+            print(f"  Daily rate: {daily_rate:.3f}")
+            print(f"  Weekly need: {stats['weekly_need']:.3f}")
+            print(f"  Days until empty: {stats['days_until_empty']:.1f}")
+            print(f"  Unit price: ${unit_price:.2f}")
 
         for order_idx, order in enumerate(orders):
             order_date = order["date"]
@@ -705,16 +812,29 @@ def build_minimal_orders(product_stats, order_dates, start_date):
                 effective_max = max(max_per_order, min_needed)
                 qty_to_order = min(qty_to_order, effective_max)
 
-                order["items"].append({
-                    "product": product,
-                    "qty": qty_to_order,
-                    "unit_price": unit_price,
-                    "total_price": qty_to_order * unit_price,
-                    "max_per_order": max_per_order,
-                    "stock_before": round(max(0, current_stock), 1),
-                    "need_until_next": round(needed_for_period, 1),
-                })
-                current_stock += qty_to_order
+                # Check if this product is already in the order (from urgent items)
+                existing_item = next((item for item in order["items"] if item["product"] == product), None)
+                if existing_item:
+                    # Product already added as urgent - skip
+                    if is_debug_product:
+                        print(yellow(f"  - Already in order on {order['date'].strftime('%Y-%m-%d')} (urgent item)"))
+                    current_stock += existing_item["qty"]
+                else:
+                    order["items"].append({
+                        "product": product,
+                        "qty": qty_to_order,
+                        "unit_price": unit_price,
+                        "total_price": qty_to_order * unit_price,
+                        "max_per_order": max_per_order,
+                        "stock_before": round(max(0, current_stock), 1),
+                        "need_until_next": round(needed_for_period, 1),
+                    })
+                    current_stock += qty_to_order
+                    
+                    if is_debug_product:
+                        print(green(f"  ✓ Added to order on {order['date'].strftime('%Y-%m-%d')}: {qty_to_order} units"))
+            elif is_debug_product:
+                print(f"  - Skipped order on {order['date'].strftime('%Y-%m-%d')}: stock={current_stock:.1f}, needed={needed_for_period:.1f}")
 
     return orders
 
@@ -891,7 +1011,7 @@ def print_weekly_plan(orders, product_stats, last_invoice_date, prediction_start
     print(f"\nLast invoice date: {last_invoice_date.strftime('%A, %d %B %Y')}")
     print(f"Prediction starts: {prediction_start.strftime('%A, %d %B %Y')}")
     print(f"Days since last order: {(prediction_start - last_invoice_date).days}")
-    print(f"Planning horizon ends: {horizon_end.strftime('%A, %d %B %Y')} (30 days from last invoice)")
+    print(f"Planning horizon ends: {horizon_end.strftime('%A, %d %B %Y')} (3 weeks from last invoice)")
     print(f"\nStrategy: {ORDERS_PER_WEEK} orders/week ({', '.join(ORDER_DAYS)})")
     print(f"Minimum order: ${MIN_ORDER_TOTAL}, Delivery fee: ${DELIVERY_FEE:.2f}")
 
@@ -1110,6 +1230,10 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
 
             print(f"\n  {'Product':<{order_product_col_width}} | {'Qty':<4} | {'$Unit':<7} | {'$Total':<7} | Notes")
             print("  " + "-" * (order_product_col_width + 32))
+            
+            # DEBUG: First order
+            if week == 0 and order['date'] == orders[0]['date']:
+                print(cyan(f"  DEBUG: Showing {len(order['items'])} items in first order"))
 
             for item in sorted(order["items"], key=lambda x: -x["total_price"]):
                 notes = []
@@ -1126,15 +1250,20 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
                     else:
                         notes.append(f"sale@${pstats.get('min_price', 0):.2f}")
 
-                print(
+                # Highlight urgent items
+                line = (
                     f"  {item['product']:<{order_product_col_width}} | "
                     f"{item['qty']:<4} | "
                     f"${item['unit_price']:<6.2f} | "
                     f"${item['total_price']:<6.2f} | "
                     f"{', '.join(notes)}"
                 )
+                if item.get("urgent"):
+                    print(red(line))
+                else:
+                    print(line)
 
-            # Add reorder prompt
+            # Add reorder prompt (outside the item loop)
             print(f"\n  Reorder via https://www.coles.com.au")
             print(f"  these items:")
             for item in sorted(order["items"], key=lambda x: -x["total_price"]):
@@ -1158,12 +1287,33 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
 
 
 def predict_two_dollar_delivery_orders():
+    # DEBUG: Products to trace
+    DEBUG_PRODUCTS = [
+        "%Swisse Ultivite Women''s Multivitamin With Key Nut",
+        "Foaming",
+        "Handwash"
+    ]
+    
     df_grouped, product_prices, last_invoice_date, price_history = load_grouped_orders()
     if df_grouped is None:
         print(red("No data found to predict."))
         return
 
     print(green(f"Loaded {len(df_grouped)} grouped records across {df_grouped['product'].nunique()} products."))
+    
+    # DEBUG: Check if target products are in the data
+    print(cyan(f"\n{'='*80}"))
+    print(cyan(bold("DEBUG: Searching for target products in data...")))
+    print(cyan(f"{'='*80}"))
+    all_products = df_grouped["product"].unique()
+    for debug_prod in DEBUG_PRODUCTS:
+        matches = [p for p in all_products if debug_prod.lower() in p.lower() or p.lower() in debug_prod.lower()]
+        if matches:
+            print(green(f"✓ Found matches for '{debug_prod}':"))
+            for match in matches:
+                print(f"  - {match}")
+        else:
+            print(red(f"✗ No matches found for '{debug_prod}'"))
 
     if last_invoice_date is None:
         print(red("Could not determine last invoice date."))
@@ -1188,13 +1338,32 @@ def predict_two_dollar_delivery_orders():
     today = pd.Timestamp.now().normalize()
     prediction_start = max(today, last_invoice_date + timedelta(days=1))
     if prediction_start > horizon_end:
-        print(f"Last invoice is over {PREDICTION_WINDOW_DAYS} days old; no forward window to plan.")
+        print(f"Last invoice is over 3 weeks old; no forward window to plan.")
         return
 
     product_stats = compute_product_stats(df_grouped, product_prices, last_invoice_date, prediction_start, promo_info, in_stock_dict, stock_date, generic_mappings, dont_order)
     if not product_stats:
         print(red("No products with measurable demand."))
         return
+    
+    # DEBUG: Check if target products made it into product_stats
+    print(cyan(f"\n{'='*80}"))
+    print(cyan(bold("DEBUG: Checking if target products are in product_stats...")))
+    print(cyan(f"{'='*80}"))
+    for debug_prod in DEBUG_PRODUCTS:
+        matches = [p for p in product_stats.keys() if debug_prod.lower() in p.lower() or p.lower() in debug_prod.lower()]
+        if matches:
+            for match in matches:
+                stats = product_stats[match]
+                print(green(f"✓ '{match}' is in product_stats:"))
+                print(f"  Daily rate: {stats['daily_rate']:.3f}")
+                print(f"  Weekly need: {stats['weekly_need']:.3f}")
+                print(f"  Estimated stock: {stats['estimated_stock']:.1f}")
+                print(f"  Days until empty: {stats['days_until_empty']:.1f}")
+                print(f"  Unit price: ${stats['unit_price']:.2f}")
+                print(f"  Frequent: {stats['frequent']}")
+        else:
+            print(red(f"✗ No matches for '{debug_prod}' in product_stats - product was filtered during compute_product_stats"))
 
     # Filter out products in dont-order list
     skipped_blocked = 0
@@ -1202,17 +1371,40 @@ def predict_two_dollar_delivery_orders():
     for product, stats in product_stats.items():
         if is_product_blocked(product, dont_order, generic_mappings):
             skipped_blocked += 1
+            # DEBUG: Check if it's one of our target products
+            for debug_prod in DEBUG_PRODUCTS:
+                if debug_prod.lower() in product.lower() or product.lower() in debug_prod.lower():
+                    print(red(f"DEBUG: '{product}' was BLOCKED by dont-order list"))
         else:
             filtered_stats[product] = stats
     product_stats = filtered_stats
     if skipped_blocked > 0:
         print(yellow(f"Skipped {skipped_blocked} products (in dont-order list)"))
+    
+    # DEBUG: Final check after dont-order filtering
+    print(cyan(f"\n{'='*80}"))
+    print(cyan(bold("DEBUG: Final check after dont-order filtering...")))
+    print(cyan(f"{'='*80}"))
+    for debug_prod in DEBUG_PRODUCTS:
+        matches = [p for p in product_stats.keys() if debug_prod.lower() in p.lower() or p.lower() in debug_prod.lower()]
+        if matches:
+            for match in matches:
+                print(green(f"✓ '{match}' survived dont-order filtering"))
+        else:
+            print(red(f"✗ '{debug_prod}' not in final product_stats"))
 
     order_dates = generate_order_dates(prediction_start, horizon_end)
     if not order_dates:
         print(yellow("No order dates fall within the one-month planning window."))
         return
     orders = build_minimal_orders(product_stats, order_dates, prediction_start)
+    
+    # DEBUG: Check first order before consolidation
+    if orders:
+        first_order_items = len(orders[0]["items"])
+        urgent_items = [item for item in orders[0]["items"] if item.get("urgent")]
+        print(cyan(f"\nDEBUG: First order has {first_order_items} items, {len(urgent_items)} urgent"))
+    
     enforce_minimums(orders, product_stats)
 
     # Remove duplicate products from consecutive orders
