@@ -20,8 +20,12 @@ source .venv/bin/activate
 
 # Install requirements
 if [ -f "requirements.txt" ]; then
-    echo "Installing dependencies (this may take a while for Prophet)..."
-    pip install -r requirements.txt
+    if python3 -c "import pandas" >/dev/null 2>&1; then
+        echo "Dependencies already available; skipping install."
+    else
+        echo "Installing dependencies (this may take a while for Prophet)..."
+        pip install -r requirements.txt
+    fi
 else
     echo "Error: requirements.txt not found."
     exit 1
@@ -29,6 +33,6 @@ fi
 
 # Run the prediction script
 echo "Running two-dollar delivery prediction script..."
-python3 05_predict_two_dollars_delivery_order.py
+python3 05_predict_two_dollars_delivery_order.py "$@"
 
 echo "Done!"
