@@ -1,3 +1,4 @@
+import argparse
 import html
 import json
 import logging
@@ -1791,7 +1792,15 @@ async function copyPrompt(id){
     print(green(f"Wrote HTML report: {output_path}"))
 
 
-def predict_two_dollar_delivery_orders():
+def analyze_product_group(group_name, df_grouped, product_stats, orders, promo_info, product_prices, generic_mappings, in_stock_dict, stock_date, prediction_start, last_invoice_date):
+    """Analyze a single generic product group end-to-end."""
+    print(cyan(bold(f"\n{'='*80}")))
+    print(cyan(bold(f"  ANALYSIS: {group_name}")))
+    print(cyan(bold(f"{'='*80}")))
+    print("(Full analysis coming in next task)")
+
+
+def predict_two_dollar_delivery_orders(analyze_group=None):
     # DEBUG: Products to trace
     DEBUG_PRODUCTS = [
         "%Swisse Ultivite Women''s Multivitamin With Key Nut",
@@ -1928,6 +1937,38 @@ def predict_two_dollar_delivery_orders():
     report_path = os.path.join(OUTPUT_DIR, "two-dollar-delivery-order-plan.html")
     write_html_report(orders, product_stats, last_invoice_date, prediction_start, horizon_end, report_path)
 
+    # Product group analysis (if requested)
+    if analyze_group:
+        # Resolve group name case-insensitively
+        group_name = None
+        for key in generic_mappings:
+            if key.lower() == analyze_group.lower():
+                group_name = key
+                break
+        if group_name is None:
+            print(red(f"\nError: No generic product group matching '{analyze_group}'."))
+            print(f"Available groups:")
+            for key in sorted(generic_mappings.keys()):
+                print(f"  - {key}")
+            return
+        analyze_product_group(
+            group_name=group_name,
+            df_grouped=df_grouped,
+            product_stats=product_stats,
+            orders=orders,
+            promo_info=promo_info,
+            product_prices=product_prices,
+            generic_mappings=generic_mappings,
+            in_stock_dict=in_stock_dict,
+            stock_date=stock_date,
+            prediction_start=prediction_start,
+            last_invoice_date=last_invoice_date,
+        )
+
 
 if __name__ == "__main__":
-    predict_two_dollar_delivery_orders()
+    parser = argparse.ArgumentParser(description="Predict Coles two-dollar delivery orders")
+    parser.add_argument("--analyze", type=str, default=None,
+                        help="Analyze a specific generic product group (case-insensitive key from generic-products.json)")
+    args = parser.parse_args()
+    predict_two_dollar_delivery_orders(analyze_group=args.analyze)
