@@ -1792,12 +1792,324 @@ async function copyPrompt(id){
     print(green(f"Wrote HTML report: {output_path}"))
 
 
+def write_analyze_html(group_name, group_products, representative, rep_stats, group_df, excluded_rows, orders, promo_info, product_prices, in_stock_dict, stock_date, output_path):
+    """Write a standalone HTML analysis report for a single product group."""
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
+    generated_at = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
+
+    parts = []
+    parts.append("<!doctype html>")
+    parts.append('<html lang="en">')
+    parts.append("<head>")
+    parts.append('  <meta charset="utf-8" />')
+    parts.append('  <meta name="viewport" content="width=device-width, initial-scale=1" />')
+    parts.append(f"  <title>Analysis: {html.escape(group_name)}</title>")
+    parts.append("  <style>")
+    parts.append("""
+:root{
+  --bg0:#fbf4e8;
+  --bg1:#e8f2f0;
+  --ink:#161816;
+  --muted:#4b514b;
+  --card:rgba(255,255,255,.74);
+  --line:rgba(22,24,22,.12);
+  --shadow:0 18px 60px rgba(22,24,22,.12);
+  --accent:#1f7a74;
+  --accent2:#c66a2f;
+  --ok:#1f6f3b;
+  --warn:#a06000;
+  --bad:#a61b2b;
+  --radius:18px;
+  --mono:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;
+  color:var(--ink);
+  background:
+    radial-gradient(1200px 650px at 12% 6%, rgba(31,122,116,.22), transparent 55%),
+    radial-gradient(900px 520px at 95% 10%, rgba(198,106,47,.20), transparent 52%),
+    linear-gradient(180deg, var(--bg0), var(--bg1));
+  font-family:"Avenir Next", Avenir, Futura, "Gill Sans", "Trebuchet MS", sans-serif;
+  -webkit-font-smoothing:antialiased;
+  line-height:1.35;
+}
+.wrap{max-width:900px;margin:0 auto;padding:28px 18px 60px}
+header{
+  padding:18px 18px 14px;
+  border:1px solid var(--line);
+  border-radius:calc(var(--radius) + 6px);
+  background:linear-gradient(180deg, rgba(255,255,255,.74), rgba(255,255,255,.58));
+  box-shadow:var(--shadow);
+  backdrop-filter:blur(10px);
+}
+h1{margin:0;font-family:"Iowan Old Style","Palatino Linotype",Palatino,serif;font-weight:700;font-size:24px}
+.sub{margin:6px 0 0;color:var(--muted);font-size:13px}
+section{
+  margin-top:14px;
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+  background:var(--card);
+  box-shadow:0 10px 40px rgba(22,24,22,.10);
+  backdrop-filter:blur(10px);
+  overflow:hidden;
+}
+section h2{
+  margin:0;padding:12px 16px;
+  font-size:15px;
+  border-bottom:1px solid var(--line);
+  background:linear-gradient(180deg, rgba(255,255,255,.65), rgba(255,255,255,.35));
+}
+section .body{padding:14px 16px}
+table{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
+thead th{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);font-weight:700;background:rgba(248,244,232,.92)}
+tbody td{padding:8px 10px;border-bottom:1px solid rgba(22,24,22,.08);vertical-align:top}
+tbody tr:nth-child(odd){background:rgba(255,255,255,.35)}
+.num{font-family:var(--mono);text-align:right;white-space:nowrap}
+.metric{display:inline-block;margin:4px 10px 4px 0;padding:6px 10px;border:1px solid var(--line);border-radius:12px;font-size:13px;background:rgba(255,255,255,.55)}
+.metric b{margin-right:4px}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+.foot{margin-top:14px;color:var(--muted);font-size:12px}
+""")
+    parts.append("  </style>")
+    parts.append("</head>")
+    parts.append("<body>")
+    parts.append('  <div class="wrap">')
+
+    # Header
+    parts.append("    <header>")
+    parts.append(f"      <h1>Analysis: {html.escape(group_name)}</h1>")
+    rep_label = f"Representative: {html.escape(representative)} ({_safe_money(rep_stats['unit_price'])})" if representative and rep_stats else "No representative found"
+    parts.append(f'      <div class="sub">{rep_label} &middot; Generated {html.escape(generated_at)}</div>')
+    parts.append(f'      <div class="sub">Products: {html.escape(", ".join(group_products))}</div>')
+    parts.append("    </header>")
+
+    # Section 1: Raw Order History
+    parts.append('    <section><h2>1. Raw Order History</h2><div class="body">')
+    if group_df is not None and not group_df.empty:
+        sorted_df = group_df.sort_values("ds")
+        parts.append('      <table><thead><tr><th>Date</th><th>Product</th><th class="num">Qty</th><th class="num">Price</th></tr></thead><tbody>')
+        for _, row in sorted_df.iterrows():
+            price = product_prices.get(row["product"], {}).get("price", 0)
+            parts.append(f'        <tr><td>{html.escape(row["ds"].strftime("%Y-%m-%d"))}</td><td>{html.escape(str(row["product"]))}</td><td class="num">{row["y"]:.0f}</td><td class="num">{html.escape(_safe_money(price))}</td></tr>')
+        parts.append("      </tbody></table>")
+        parts.append(f'      <div class="foot">{len(sorted_df)} rows</div>')
+    else:
+        parts.append("      <p>No order history found.</p>")
+    parts.append("    </div></section>")
+
+    # Section 2: Anomalies Excluded
+    parts.append('    <section><h2>2. Anomalies Excluded</h2><div class="body">')
+    if excluded_rows:
+        parts.append('      <table><thead><tr><th>Date</th><th class="num">Qty</th><th class="num">Threshold</th><th class="num">Median</th><th>Reason</th></tr></thead><tbody>')
+        for ex in excluded_rows:
+            parts.append(f'        <tr><td>{html.escape(ex["date"].strftime("%Y-%m-%d"))}</td><td class="num">{ex["qty"]:.0f}</td><td class="num">{ex["threshold"]:.1f}</td><td class="num">{ex["median"]:.1f}</td><td>Upper outlier</td></tr>')
+        parts.append("      </tbody></table>")
+    else:
+        parts.append('      <p class="ok">None detected</p>')
+    parts.append("    </div></section>")
+
+    # Section 3: Consumption Metrics
+    parts.append('    <section><h2>3. Consumption Metrics</h2><div class="body">')
+    if rep_stats:
+        dr = rep_stats["daily_rate"]
+        ai = rep_stats["avg_interval"]
+        aq = rep_stats["avg_qty_per_order"]
+        oc = rep_stats["order_count"]
+        wn = rep_stats["weekly_need"]
+        parts.append(f'      <span class="metric"><b>Daily rate:</b> {dr:.4f}</span>')
+        parts.append(f'      <span class="metric"><b>Weekly need:</b> {wn:.2f}</span>')
+        parts.append(f'      <span class="metric"><b>Avg interval:</b> {f"{ai:.1f} days" if ai else "N/A"}</span>')
+        parts.append(f'      <span class="metric"><b>Avg qty/order:</b> {aq:.2f}</span>')
+        parts.append(f'      <span class="metric"><b>Order count:</b> {oc}</span>')
+        parts.append(f'      <span class="metric"><b>Frequent:</b> {"Yes" if rep_stats["frequent"] else "No"}</span>')
+    else:
+        parts.append("      <p>No metrics available.</p>")
+    parts.append("    </div></section>")
+
+    # Section 4: Stock Estimate
+    parts.append('    <section><h2>4. Stock Estimate</h2><div class="body">')
+    if rep_stats:
+        parts.append(f'      <span class="metric"><b>Source:</b> {html.escape(rep_stats["stock_source"])}</span>')
+        if stock_date:
+            parts.append(f'      <span class="metric"><b>Stock date:</b> {html.escape(stock_date.strftime("%Y-%m-%d"))}</span>')
+        parts.append(f'      <span class="metric"><b>Estimated stock:</b> {rep_stats["estimated_stock"]:.1f}</span>')
+        dte = rep_stats["days_until_empty"]
+        dte_class = "ok" if dte > 7 else ("warn" if dte > 3 else "bad")
+        parts.append(f'      <span class="metric"><b>Days until empty:</b> <span class="{dte_class}">{dte:.1f}</span></span>')
+    else:
+        parts.append("      <p>No stock data available.</p>")
+    parts.append("    </div></section>")
+
+    # Section 5: Order Plan
+    parts.append('    <section><h2>5. Order Plan</h2><div class="body">')
+    order_rows = []
+    if representative:
+        for idx, order in enumerate(orders):
+            if order.get("skipped"):
+                continue
+            for item in order.get("items", []):
+                if item["product"] == representative:
+                    order_rows.append((idx, order, item))
+    if order_rows:
+        parts.append('      <table><thead><tr><th>Order</th><th>Date</th><th class="num">Qty</th><th class="num">Total</th><th>Stock Before</th><th>Notes</th></tr></thead><tbody>')
+        for idx, order, item in order_rows:
+            date_str = order["date"].strftime("%A, %d %B %Y")
+            notes = "URGENT" if item.get("urgent") else ""
+            parts.append(f'        <tr><td>#{idx+1}</td><td>{html.escape(date_str)}</td><td class="num">{item["qty"]}</td><td class="num">{html.escape(_safe_money(item["total_price"]))}</td><td>{item.get("stock_before", "?")}</td><td>{html.escape(notes)}</td></tr>')
+        parts.append("      </tbody></table>")
+    else:
+        parts.append('      <p class="warn">Not scheduled in any order</p>')
+    parts.append("    </div></section>")
+
+    # Section 6: Promo Patterns
+    parts.append('    <section><h2>6. Promo Patterns</h2><div class="body">')
+    if rep_stats and rep_stats.get("has_promos"):
+        parts.append(f'      <span class="metric"><b>Price range:</b> {_safe_money(rep_stats["min_price"])} - {_safe_money(rep_stats["max_price"])}</span>')
+        parts.append(f'      <span class="metric"><b>Avg price:</b> {_safe_money(rep_stats["avg_price"])}</span>')
+        parts.append(f'      <span class="metric"><b>Savings:</b> {rep_stats["savings_pct"]:.0f}%</span>')
+        best_days = ", ".join(rep_stats.get("best_days", [])) or "N/A"
+        best_weeks = ", ".join(str(w) for w in rep_stats.get("best_weeks", [])) or "N/A"
+        parts.append(f'      <span class="metric"><b>Best days:</b> {html.escape(best_days)}</span>')
+        parts.append(f'      <span class="metric"><b>Best weeks:</b> {html.escape(best_weeks)}</span>')
+        parts.append(f'      <span class="metric"><b>Stock-up qty:</b> {rep_stats["promo_stock_up"]}</span>')
+    else:
+        parts.append('      <p class="warn">No promotional patterns detected</p>')
+    parts.append("    </div></section>")
+
+    parts.append('    <div class="foot">')
+    parts.append(f'      Report: <span style="font-family:var(--mono)">{html.escape(output_path)}</span>')
+    parts.append("    </div>")
+    parts.append("  </div>")
+    parts.append("</body>")
+    parts.append("</html>")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(parts))
+
+    print(green(f"\nWrote analysis HTML report: {output_path}"))
+
+
 def analyze_product_group(group_name, df_grouped, product_stats, orders, promo_info, product_prices, generic_mappings, in_stock_dict, stock_date, prediction_start, last_invoice_date):
     """Analyze a single generic product group end-to-end."""
+    group_products = generic_mappings.get(group_name, [])
+
     print(cyan(bold(f"\n{'='*80}")))
     print(cyan(bold(f"  ANALYSIS: {group_name}")))
     print(cyan(bold(f"{'='*80}")))
-    print("(Full analysis coming in next task)")
+    print(f"Group products: {', '.join(group_products)}")
+
+    # Find representative in product_stats
+    representative = None
+    rep_stats = None
+    for p, s in product_stats.items():
+        if s.get("is_group_representative") and s.get("group_name") == group_name:
+            representative = p
+            rep_stats = s
+            break
+
+    if representative:
+        print(f"Representative: {representative} ({_safe_money(rep_stats['unit_price'])})")
+    else:
+        print(yellow("No representative found in product_stats (group may have been filtered out)"))
+
+    # --- Section 1: Raw Order History ---
+    print(cyan(bold(f"\n--- 1. RAW ORDER HISTORY ---")))
+    group_df = df_grouped[df_grouped["product"].isin(group_products)].copy()
+    if group_df.empty:
+        print(yellow("  No order history found for this group."))
+    else:
+        group_df = group_df.sort_values("ds")
+        print(f"  {'Date':<14}{'Product':<50}{'Qty':>6}{'Price':>10}")
+        print(f"  {'-'*14}{'-'*50}{'-'*6}{'-'*10}")
+        for _, row in group_df.iterrows():
+            price = product_prices.get(row["product"], {}).get("price", 0)
+            print(f"  {row['ds'].strftime('%Y-%m-%d'):<14}{row['product'][:49]:<50}{row['y']:>6.0f}{_safe_money(price):>10}")
+        print(f"  Total rows: {len(group_df)}")
+
+    # --- Section 2: Anomalies Excluded ---
+    print(cyan(bold(f"\n--- 2. ANOMALIES EXCLUDED ---")))
+    oldest_invoice_date = df_grouped["ds"].min()
+    group_daily_df = group_df.groupby("ds")["y"].sum().reset_index() if not group_df.empty else pd.DataFrame(columns=["ds", "y"])
+    if not group_daily_df.empty:
+        _, _, _, _, _, _, _, excluded_rows = calculate_consumption_metrics(group_daily_df, oldest_invoice_date)
+    else:
+        excluded_rows = []
+    if excluded_rows:
+        print(f"  {'Date':<14}{'Qty':>6}{'Threshold':>12}{'Median':>10}  Reason")
+        print(f"  {'-'*14}{'-'*6}{'-'*12}{'-'*10}  {'-'*14}")
+        for ex in excluded_rows:
+            print(f"  {ex['date'].strftime('%Y-%m-%d'):<14}{ex['qty']:>6.0f}{ex['threshold']:>12.1f}{ex['median']:>10.1f}  Upper outlier")
+    else:
+        print(green("  None detected"))
+
+    # --- Section 3: Consumption Metrics ---
+    print(cyan(bold(f"\n--- 3. CONSUMPTION METRICS ---")))
+    if rep_stats:
+        dr = rep_stats["daily_rate"]
+        ai = rep_stats["avg_interval"]
+        aq = rep_stats["avg_qty_per_order"]
+        oc = rep_stats["order_count"]
+        wn = rep_stats["weekly_need"]
+        print(f"  Daily rate: {dr:.4f}")
+        print(f"  Weekly need: {wn:.2f}")
+        print(f"  Avg interval: {f'{ai:.1f} days' if ai else 'N/A'}")
+        print(f"  Avg qty/order: {aq:.2f}")
+        print(f"  Order count: {oc}")
+        print(f"  Frequent: {rep_stats['frequent']}")
+    else:
+        print(yellow("  No consumption metrics (no representative found)"))
+
+    # --- Section 4: Stock Estimate ---
+    print(cyan(bold(f"\n--- 4. STOCK ESTIMATE ---")))
+    if rep_stats:
+        print(f"  Source: {rep_stats['stock_source']}")
+        if stock_date:
+            print(f"  Stock date: {stock_date.strftime('%Y-%m-%d')}")
+        # Show actual stock values from in-stock
+        for p in group_products:
+            qty = match_product_to_stock(p, in_stock_dict)
+            if qty is not None:
+                print(f"  In-stock match: {p} = {qty}")
+        print(f"  Estimated current stock: {rep_stats['estimated_stock']:.1f}")
+        print(f"  Days until empty: {rep_stats['days_until_empty']:.1f}")
+    else:
+        print(yellow("  No stock estimate (no representative found)"))
+
+    # --- Section 5: Order Plan ---
+    print(cyan(bold(f"\n--- 5. ORDER PLAN ---")))
+    found_in_orders = False
+    for idx, order in enumerate(orders):
+        if order.get("skipped"):
+            continue
+        for item in order.get("items", []):
+            if item["product"] == representative:
+                found_in_orders = True
+                date_str = order["date"].strftime("%Y-%m-%d (%A)")
+                urgent_tag = " [URGENT]" if item.get("urgent") else ""
+                print(f"  Order #{idx+1} ({date_str}): {item['qty']}x {representative} = {_safe_money(item['total_price'])}{urgent_tag}")
+                print(f"    Stock before: {item.get('stock_before', '?')}, Need until next: {item.get('need_until_next', '?')}")
+    if not found_in_orders:
+        print(yellow("  Not scheduled in any order"))
+
+    # --- Section 6: Promo Patterns ---
+    print(cyan(bold(f"\n--- 6. PROMO PATTERNS ---")))
+    if rep_stats and rep_stats.get("has_promos"):
+        print(f"  Has promos: Yes")
+        print(f"  Price range: {_safe_money(rep_stats['min_price'])} - {_safe_money(rep_stats['max_price'])} (avg {_safe_money(rep_stats['avg_price'])})")
+        print(f"  Savings: {rep_stats['savings_pct']:.0f}%")
+        print(f"  Best days: {', '.join(rep_stats.get('best_days', [])) or 'N/A'}")
+        print(f"  Best weeks: {', '.join(str(w) for w in rep_stats.get('best_weeks', [])) or 'N/A'}")
+        print(f"  Promo stock-up qty: {rep_stats['promo_stock_up']}")
+    elif rep_stats:
+        print(yellow("  No promotional patterns detected"))
+    else:
+        print(yellow("  No promo data (no representative found)"))
+
+    # Write HTML analysis report
+    html_path = os.path.join(OUTPUT_DIR, f"analyze-{group_name.lower().replace(' ', '-')}.html")
+    write_analyze_html(group_name, group_products, representative, rep_stats, group_df, excluded_rows, orders, promo_info, product_prices, in_stock_dict, stock_date, html_path)
 
 
 def predict_two_dollar_delivery_orders(analyze_group=None):
