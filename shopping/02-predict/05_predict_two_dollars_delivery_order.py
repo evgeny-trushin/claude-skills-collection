@@ -1,3 +1,4 @@
+import html
 import json
 import logging
 import os
@@ -106,15 +107,26 @@ def find_generic_product(product, generic_mappings):
     return None
 
 
+def _norm(s):
+    """Normalize apostrophes and case for matching."""
+    return s.replace("''", "'").replace("\u2019", "'").lower().strip()
+
+
 def is_product_blocked(product, dont_order_set, generic_mappings):
     """Check if product or its generic group is in dont-order list"""
     # Direct match
     if product in dont_order_set:
         return True
 
-    # Partial match
+    product_norm = _norm(product)
+
+    # Normalized / partial / substring match
     for blocked in dont_order_set:
-        if product.startswith(blocked) or blocked.startswith(product):
+        blocked_norm = _norm(blocked)
+        if (product_norm == blocked_norm
+                or product_norm.startswith(blocked_norm)
+                or blocked_norm.startswith(product_norm)
+                or blocked_norm in product_norm):
             return True
 
     # Check if any product in same generic group is blocked
@@ -123,8 +135,13 @@ def is_product_blocked(product, dont_order_set, generic_mappings):
         for p in generic_mappings[generic_name]:
             if p in dont_order_set:
                 return True
+            p_norm = _norm(p)
             for blocked in dont_order_set:
-                if p.startswith(blocked) or blocked.startswith(p):
+                blocked_norm = _norm(blocked)
+                if (p_norm == blocked_norm
+                        or p_norm.startswith(blocked_norm)
+                        or blocked_norm.startswith(p_norm)
+                        or blocked_norm in p_norm):
                     return True
 
     return False
@@ -320,16 +337,51 @@ def calculate_consumption_metrics(df, oldest_invoice_date):
     """
     Calculate consumption metrics for a dataset (single product or group).
     df: DataFrame with 'ds' (date) and 'y' (quantity) columns.
-    Returns: daily_rate, avg_interval, avg_qty_per_order, last_date, last_order_qty, total_qty, order_count
+    Returns: daily_rate, avg_interval, avg_qty_per_order, last_date, last_order_qty, total_qty, order_count, excluded_rows
     """
     # Ensure sorted
     df = df.sort_values("ds")
-    
+
+    excluded_rows = []
+
+    # Anomaly detection: exclude upper outlier quantities (accidental large orders)
+    if len(df) >= 3:
+        quantities = df["y"]
+        median_val = quantities.median()
+
+        if median_val > 0:
+            if len(df) <= 5:
+                upper_bound = median_val * 3.0
+            else:
+                q1 = quantities.quantile(0.25)
+                q3 = quantities.quantile(0.75)
+                iqr = q3 - q1
+                iqr_bound = (q3 + 1.5 * iqr) if iqr > 0 else q3
+                upper_bound = max(iqr_bound, median_val * 2.5)
+
+            outlier_mask = quantities > upper_bound
+            if outlier_mask.any():
+                for idx in df[outlier_mask].index:
+                    row = df.loc[idx]
+                    excluded_rows.append({
+                        "date": row["ds"],
+                        "qty": row["y"],
+                        "threshold": upper_bound,
+                        "median": median_val,
+                    })
+                    print(yellow(
+                        f"  Anomaly detected: qty={row['y']:.0f} on "
+                        f"{row['ds'].strftime('%Y-%m-%d')} "
+                        f"(threshold={upper_bound:.1f}, median={median_val:.1f})"
+                        f" -- excluded from consumption calc"
+                    ))
+                df = df[~outlier_mask].copy()
+
     total_qty = df["y"].sum()
     order_count = len(df)
-    
+
     if order_count == 0:
-        return 0, 0, 0, None, 0, 0, 0
+        return 0, 0, 0, None, 0, 0, 0, excluded_rows
 
     first_date = df["ds"].min()
     last_date = df["ds"].max()
@@ -370,7 +422,7 @@ def calculate_consumption_metrics(df, oldest_invoice_date):
             # Order is on the oldest invoice date - default to weekly consumption
             daily_rate = total_qty / 7
             
-    return daily_rate, avg_interval, avg_qty_per_order, last_date, last_order_qty, total_qty, order_count
+    return daily_rate, avg_interval, avg_qty_per_order, last_date, last_order_qty, total_qty, order_count, excluded_rows
 
 
 def compute_product_stats(df_grouped, product_prices, last_invoice_date, prediction_start, promo_info=None, in_stock_dict=None, stock_date=None, generic_mappings=None, dont_order_set=None):
@@ -424,7 +476,7 @@ def compute_product_stats(df_grouped, product_prices, last_invoice_date, predict
         group_daily_df = group_df.groupby("ds")["y"].sum().reset_index()
 
         # Calculate metrics for the GROUP
-        daily_rate, avg_interval, avg_qty_per_order, last_date, last_order_qty, total_qty, order_count = \
+        daily_rate, avg_interval, avg_qty_per_order, last_date, last_order_qty, total_qty, order_count, _ = \
             calculate_consumption_metrics(group_daily_df, oldest_invoice_date)
 
         if total_qty <= 0 or daily_rate <= 0:
@@ -557,7 +609,7 @@ def compute_product_stats(df_grouped, product_prices, last_invoice_date, predict
         product_df = df_grouped[df_grouped["product"] == product]
         
         # Calculate consumption metrics
-        daily_rate, avg_interval, avg_qty_per_order, last_date, last_order_qty, total_qty, order_count = \
+        daily_rate, avg_interval, avg_qty_per_order, last_date, last_order_qty, total_qty, order_count, _ = \
             calculate_consumption_metrics(product_df, oldest_invoice_date)
             
         if total_qty <= 0: 
@@ -1286,6 +1338,459 @@ Current order schedule: {', '.join(ORDER_DAYS)} (optimized for discounts)
     print(green(bold(f"  TOTAL: ${total_spend:.2f}")))
 
 
+def _safe_money(value):
+    try:
+        return f"${float(value):.2f}"
+    except Exception:
+        return "$0.00"
+
+
+def _format_date(dt):
+    if dt is None:
+        return ""
+    try:
+        return pd.to_datetime(dt).strftime("%A, %d %B %Y")
+    except Exception:
+        return str(dt)
+
+
+def _build_reorder_prompt(order):
+    # Kept intentionally simple so it works as a reusable "prompt" anywhere.
+    lines = []
+    order_date = order.get("date")
+    if order_date is not None:
+        lines.append(f"ORDER DATE: {pd.to_datetime(order_date).strftime('%A, %d %B %Y')}")
+        lines.append("")
+    lines.append("Reorder via https://www.coles.com.au")
+    lines.append("these items:")
+    for item in sorted(order.get("items", []), key=lambda x: -x.get("total_price", 0)):
+        product_name = str(item.get("product", "")).lstrip("%").strip()
+        qty = item.get("qty", 0)
+        lines.append(f"{product_name} x{qty}")
+    return "\n".join(lines).strip() + "\n"
+
+
+def write_html_report(orders, product_stats, last_invoice_date, prediction_start, horizon_end, output_path):
+    """
+    Write a standalone HTML report with:
+    - clean, readable tables per order
+    - a textarea "prompt" per order + copy button
+    """
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    today = pd.Timestamp.now().normalize()
+    generated_at = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
+
+    active_orders = [o for o in orders if not o.get("skipped") and o.get("items")]
+    skipped_orders = [o for o in orders if o.get("skipped")]
+
+    orders_placed = len(active_orders)
+    total_spend = sum(float(o.get("total_with_delivery", 0) or 0) for o in active_orders)
+    delivery_fees = DELIVERY_FEE * orders_placed
+
+    def badge(text, kind):
+        return f'<span class="badge badge-{kind}">{html.escape(text)}</span>'
+
+    parts = []
+    parts.append("<!doctype html>")
+    parts.append('<html lang="en">')
+    parts.append("<head>")
+    parts.append('  <meta charset="utf-8" />')
+    parts.append('  <meta name="viewport" content="width=device-width, initial-scale=1" />')
+    parts.append("  <title>Coles Order Plan</title>")
+    parts.append("  <style>")
+    parts.append("""
+:root{
+  --bg0:#fbf4e8;
+  --bg1:#e8f2f0;
+  --ink:#161816;
+  --muted:#4b514b;
+  --card:rgba(255,255,255,.74);
+  --line:rgba(22,24,22,.12);
+  --shadow:0 18px 60px rgba(22,24,22,.12);
+  --accent:#1f7a74;
+  --accent2:#c66a2f;
+  --ok:#1f6f3b;
+  --warn:#a06000;
+  --bad:#a61b2b;
+  --radius:18px;
+  --mono:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;
+  color:var(--ink);
+  background:
+    radial-gradient(1200px 650px at 12% 6%, rgba(31,122,116,.22), transparent 55%),
+    radial-gradient(900px 520px at 95% 10%, rgba(198,106,47,.20), transparent 52%),
+    linear-gradient(180deg, var(--bg0), var(--bg1));
+  font-family:"Avenir Next", Avenir, Futura, "Gill Sans", "Trebuchet MS", sans-serif;
+  -webkit-font-smoothing:antialiased;
+  line-height:1.35;
+}
+.wrap{max-width:1120px;margin:0 auto;padding:28px 18px 60px}
+header{
+  padding:18px 18px 14px;
+  border:1px solid var(--line);
+  border-radius:calc(var(--radius) + 6px);
+  background:linear-gradient(180deg, rgba(255,255,255,.74), rgba(255,255,255,.58));
+  box-shadow:var(--shadow);
+  backdrop-filter:blur(10px);
+  position:relative;
+  overflow:hidden;
+}
+header:before{
+  content:"";
+  position:absolute; inset:-2px;
+  background:
+    radial-gradient(900px 260px at 8% 0%, rgba(31,122,116,.18), transparent 65%),
+    radial-gradient(700px 260px at 98% 0%, rgba(198,106,47,.16), transparent 60%);
+  pointer-events:none;
+}
+.title{
+  position:relative;
+  display:flex; gap:14px; align-items:flex-end; justify-content:space-between; flex-wrap:wrap;
+}
+h1{
+  margin:0;
+  font-family:"Iowan Old Style","Palatino Linotype",Palatino,serif;
+  font-weight:700;
+  letter-spacing:.2px;
+  font-size:28px;
+}
+.sub{
+  margin:6px 0 0;
+  color:var(--muted);
+  font-size:14px;
+}
+.meta{
+  position:relative;
+  display:flex; gap:10px; flex-wrap:wrap;
+  margin-top:14px;
+}
+.pill{
+  border:1px solid var(--line);
+  border-radius:999px;
+  padding:8px 10px;
+  background:rgba(255,255,255,.55);
+  font-size:13px;
+}
+.grid{
+  display:grid;
+  grid-template-columns:1fr;
+  gap:14px;
+  margin-top:18px;
+}
+.card{
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+  background:var(--card);
+  box-shadow:0 10px 40px rgba(22,24,22,.10);
+  backdrop-filter:blur(10px);
+  overflow:hidden;
+  animation:rise .35s ease-out both;
+}
+@keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+.card-h{
+  padding:14px 16px 10px;
+  display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap;
+  border-bottom:1px solid var(--line);
+  background:linear-gradient(180deg, rgba(255,255,255,.65), rgba(255,255,255,.35));
+}
+.card-h .when{
+  font-weight:700;
+  letter-spacing:.2px;
+  font-size:16px;
+}
+.card-h .when small{display:block;color:var(--muted);font-weight:500;font-size:12px;margin-top:3px}
+.badges{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.badge{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:7px 10px;
+  border-radius:999px;
+  font-size:12px;
+  border:1px solid var(--line);
+  background:rgba(255,255,255,.55);
+}
+.badge-ok{border-color:rgba(31,111,59,.25); color:var(--ok)}
+.badge-warn{border-color:rgba(160,96,0,.25); color:var(--warn)}
+.badge-bad{border-color:rgba(166,27,43,.25); color:var(--bad)}
+.body{
+  display:grid;
+  grid-template-columns:1.3fr .7fr;
+  gap:14px;
+  padding:14px 16px 16px;
+}
+.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px;background:rgba(255,255,255,.55)}
+table{
+  width:100%;
+  border-collapse:separate;
+  border-spacing:0;
+  min-width:680px;
+  font-size:13px;
+}
+thead th{
+  position:sticky; top:0;
+  background:rgba(248,244,232,.92);
+  backdrop-filter:blur(8px);
+  text-align:left;
+  padding:10px 10px;
+  border-bottom:1px solid var(--line);
+  font-weight:700;
+}
+tbody td{
+  padding:10px 10px;
+  border-bottom:1px solid rgba(22,24,22,.08);
+  vertical-align:top;
+}
+tbody tr:nth-child(odd){background:rgba(255,255,255,.35)}
+.num{font-family:var(--mono); text-align:right; white-space:nowrap}
+.notes{color:var(--muted)}
+.row-urgent{background:rgba(166,27,43,.08)!important}
+.row-sale{background:rgba(31,111,59,.07)!important}
+.prompt{
+  border:1px solid var(--line);
+  border-radius:14px;
+  background:rgba(255,255,255,.55);
+  overflow:hidden;
+  display:flex;
+  flex-direction:column;
+  min-height:260px;
+}
+.prompt-h{
+  display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:10px 10px;
+  border-bottom:1px solid var(--line);
+}
+.prompt-h b{font-size:13px}
+textarea{
+  width:100%;
+  resize:vertical;
+  min-height:200px;
+  border:0;
+  outline:0;
+  padding:10px 10px 12px;
+  background:transparent;
+  color:var(--ink);
+  font-family:var(--mono);
+  font-size:12px;
+  line-height:1.35;
+}
+.btn{
+  appearance:none;
+  border:1px solid rgba(31,122,116,.35);
+  background:linear-gradient(180deg, rgba(31,122,116,.14), rgba(31,122,116,.06));
+  color:var(--ink);
+  border-radius:12px;
+  padding:8px 10px;
+  font-size:12px;
+  cursor:pointer;
+  transition:transform .08s ease, box-shadow .12s ease, background .12s ease;
+}
+.btn:hover{box-shadow:0 10px 25px rgba(31,122,116,.12)}
+.btn:active{transform:translateY(1px)}
+.toast{
+  position:fixed;
+  right:16px;
+  bottom:16px;
+  background:rgba(22,24,22,.88);
+  color:#fff;
+  padding:10px 12px;
+  border-radius:12px;
+  font-size:12px;
+  opacity:0;
+  transform:translateY(6px);
+  transition:opacity .15s ease, transform .15s ease;
+  pointer-events:none;
+}
+.toast.show{opacity:1;transform:translateY(0)}
+.foot{
+  margin-top:14px;
+  color:var(--muted);
+  font-size:12px;
+}
+@media (max-width: 980px){
+  .body{grid-template-columns:1fr}
+  table{min-width:620px}
+}
+""")
+    parts.append("  </style>")
+    parts.append("</head>")
+    parts.append("<body>")
+    parts.append('  <div class="wrap">')
+    parts.append("    <header>")
+    parts.append('      <div class="title">')
+    parts.append('        <div>')
+    parts.append("          <h1>Coles Order Plan</h1>")
+    parts.append(f'          <div class="sub">Generated {html.escape(generated_at)}. Minimal-stock strategy with {ORDERS_PER_WEEK} orders/week.</div>')
+    parts.append("        </div>")
+    parts.append('        <div class="badges">')
+    parts.append(badge(f"{orders_placed} orders", "ok" if orders_placed else "warn"))
+    parts.append(badge(f"Total {_safe_money(total_spend)}", "ok"))
+    parts.append(badge(f"Delivery {_safe_money(delivery_fees)}", "warn" if delivery_fees else "ok"))
+    parts.append("        </div>")
+    parts.append("      </div>")
+    parts.append('      <div class="meta">')
+    parts.append(f'        <div class="pill"><b>Last invoice</b>: {html.escape(_format_date(last_invoice_date))}</div>')
+    parts.append(f'        <div class="pill"><b>Start</b>: {html.escape(_format_date(prediction_start))}</div>')
+    parts.append(f'        <div class="pill"><b>Horizon end</b>: {html.escape(_format_date(horizon_end))}</div>')
+    parts.append(f'        <div class="pill"><b>Min order</b>: {_safe_money(MIN_ORDER_TOTAL)} <span style="color:var(--muted)">+ delivery</span></div>')
+    parts.append("      </div>")
+    parts.append("    </header>")
+
+    if skipped_orders:
+        parts.append(f'<div class="foot">Skipped/merged orders: {len(skipped_orders)} (merged into nearby orders).</div>')
+
+    parts.append('    <div class="grid">')
+
+    for idx, order in enumerate(active_orders, start=1):
+        order_date = pd.to_datetime(order.get("date"))
+        days_until = (order_date.normalize() - today).days
+        urgent = days_until <= 3
+        meets = bool(order.get("meets_minimum"))
+        items_total = float(order.get("items_total", 0) or 0)
+        total_with_delivery = float(order.get("total_with_delivery", 0) or 0)
+
+        if meets:
+            status_badge = badge("MEETS MINIMUM", "ok")
+        else:
+            status_badge = badge("BELOW MINIMUM", "bad")
+
+        when_sub = f"in {days_until} day(s)" if days_until >= 0 else f"{abs(days_until)} day(s) ago"
+        if urgent:
+            when_sub += " (soon)"
+
+        prompt_id = f"prompt-{idx}"
+        prompt_text = _build_reorder_prompt(order)
+
+        parts.append('      <section class="card">')
+        parts.append('        <div class="card-h">')
+        parts.append(f'          <div class="when">Order {idx}: {html.escape(order_date.strftime("%A, %d %B %Y"))}<small>{html.escape(when_sub)}</small></div>')
+        parts.append('          <div class="badges">')
+        parts.append(status_badge)
+        if urgent:
+            parts.append(badge("URGENT", "bad"))
+        parts.append(badge(f"Items {_safe_money(items_total)}", "warn" if not meets else "ok"))
+        parts.append(badge(f"With delivery {_safe_money(total_with_delivery)}", "ok" if meets else "warn"))
+        parts.append("          </div>")
+        parts.append("        </div>")
+
+        parts.append('        <div class="body">')
+        parts.append('          <div class="table-wrap">')
+        parts.append("            <table>")
+        parts.append("              <thead><tr>")
+        parts.append("                <th style=\"width:54%\">Product</th>")
+        parts.append("                <th class=\"num\" style=\"width:10%\">Qty</th>")
+        parts.append("                <th class=\"num\" style=\"width:12%\">Unit</th>")
+        parts.append("                <th class=\"num\" style=\"width:12%\">Total</th>")
+        parts.append("                <th style=\"width:12%\">Notes</th>")
+        parts.append("              </tr></thead>")
+        parts.append("              <tbody>")
+
+        for item in sorted(order.get("items", []), key=lambda x: -x.get("total_price", 0)):
+            raw_name = str(item.get("product", ""))
+            product_name = raw_name.lstrip("%").strip()
+            qty = item.get("qty", 0)
+            unit_price = float(item.get("unit_price", 0) or 0)
+            total_price = float(item.get("total_price", 0) or 0)
+
+            notes = []
+            if item.get("topped_up"):
+                notes.append("top-up")
+            elif float(item.get("stock_before", 999)) < 0.5:
+                notes.append("restock")
+
+            pstats = product_stats.get(raw_name, product_stats.get(product_name, {})) if product_stats else {}
+            on_sale = False
+            if pstats.get("has_promos"):
+                min_price = float(pstats.get("min_price", unit_price) or unit_price)
+                if unit_price <= min_price:
+                    notes.append("ON SALE")
+                    on_sale = True
+                else:
+                    notes.append(f"sale@{_safe_money(min_price)}")
+
+            row_class = []
+            if item.get("urgent"):
+                row_class.append("row-urgent")
+            if on_sale:
+                row_class.append("row-sale")
+            row_class_attr = f' class="{" ".join(row_class)}"' if row_class else ""
+
+            parts.append(f"                <tr{row_class_attr}>")
+            parts.append(f"                  <td>{html.escape(product_name)}</td>")
+            parts.append(f"                  <td class=\"num\">{html.escape(str(qty))}</td>")
+            parts.append(f"                  <td class=\"num\">{html.escape(_safe_money(unit_price))}</td>")
+            parts.append(f"                  <td class=\"num\">{html.escape(_safe_money(total_price))}</td>")
+            parts.append(f"                  <td class=\"notes\">{html.escape(', '.join(notes))}</td>")
+            parts.append("                </tr>")
+
+        parts.append("              </tbody>")
+        parts.append("            </table>")
+        parts.append("          </div>")
+
+        parts.append('          <aside class="prompt">')
+        parts.append('            <div class="prompt-h">')
+        parts.append('              <b>Copyable Prompt</b>')
+        parts.append(f'              <button class="btn" type="button" onclick="copyPrompt({html.escape(repr(prompt_id))})">Copy</button>')
+        parts.append("            </div>")
+        parts.append(f'            <textarea id="{html.escape(prompt_id)}" readonly spellcheck="false">{html.escape(prompt_text)}</textarea>')
+        parts.append("          </aside>")
+        parts.append("        </div>")
+
+        if order.get("notes"):
+            notes_joined = " | ".join(str(n) for n in order.get("notes", []))
+            parts.append(f'        <div class="foot" style="padding:0 16px 14px">{html.escape(notes_joined)}</div>')
+
+        parts.append("      </section>")
+
+    parts.append("    </div>")
+
+    parts.append('    <div class="foot">')
+    parts.append(f'      Report file: <span style="font-family:var(--mono)">{html.escape(output_path)}</span>')
+    parts.append("    </div>")
+
+    parts.append('    <div id="toast" class="toast">Copied</div>')
+    parts.append("  </div>")
+    parts.append("  <script>")
+    parts.append("""
+function showToast(text){
+  const el = document.getElementById('toast');
+  el.textContent = text || 'Copied';
+  el.classList.add('show');
+  window.clearTimeout(showToast._t);
+  showToast._t = window.setTimeout(() => el.classList.remove('show'), 1100);
+}
+async function copyPrompt(id){
+  const ta = document.getElementById(id);
+  if (!ta) return;
+  const text = ta.value;
+  try{
+    await navigator.clipboard.writeText(text);
+    showToast('Copied prompt');
+    return;
+  }catch(e){}
+  try{
+    ta.focus();
+    ta.select();
+    document.execCommand('copy');
+    showToast('Copied prompt');
+  }catch(e){
+    showToast('Copy failed');
+  }
+}
+""")
+    parts.append("  </script>")
+    parts.append("</body>")
+    parts.append("</html>")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(parts))
+
+    print(green(f"Wrote HTML report: {output_path}"))
+
+
 def predict_two_dollar_delivery_orders():
     # DEBUG: Products to trace
     DEBUG_PRODUCTS = [
@@ -1420,6 +1925,8 @@ def predict_two_dollar_delivery_orders():
             order["meets_minimum"] = order["items_total"] >= MIN_ORDER_TOTAL
 
     print_weekly_plan(orders, product_stats, last_invoice_date, prediction_start, horizon_end)
+    report_path = os.path.join(OUTPUT_DIR, "two-dollar-delivery-order-plan.html")
+    write_html_report(orders, product_stats, last_invoice_date, prediction_start, horizon_end, report_path)
 
 
 if __name__ == "__main__":
