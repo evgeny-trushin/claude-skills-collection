@@ -70,3 +70,18 @@ echo "=== Step 5: Running 02-predict/05_predict_two_dollars_delivery_order.sh ==
 
 cd ..
 echo "=== Pipeline completed successfully ==="
+
+REPORT_FILE="02-predict/output_extracted/two-dollar-delivery-order-plan.html"
+if [ -f "$REPORT_FILE" ]; then
+    echo "Opening report: $REPORT_FILE"
+    if command -v open >/dev/null 2>&1; then
+        open "$REPORT_FILE" || true
+    elif command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$REPORT_FILE" >/dev/null 2>&1 || true
+    else
+        echo "No 'open' or 'xdg-open' found. Report is at: $REPORT_FILE"
+    fi
+else
+    echo "Report not found: $REPORT_FILE"
+    echo "If step 5 ran, check 02-predict/output_extracted/ for the HTML report."
+fi

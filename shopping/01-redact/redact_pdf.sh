@@ -33,8 +33,12 @@ export PIP_PROGRESS_BAR=off
 export PIP_NO_INPUT=1
 
 echo "Installing dependencies from $REQ_FILE..."
-python3 -m pip install --upgrade pip --quiet
-python3 -m pip install --quiet --no-cache-dir -r "$REQ_FILE"
+if python3 -c "import fitz" >/dev/null 2>&1; then
+    echo "Dependencies already available; skipping install."
+else
+    python3 -m pip install --upgrade pip --quiet
+    python3 -m pip install --quiet --no-cache-dir -r "$REQ_FILE"
+fi
 
 # Run the redaction script
 echo "Running PDF redaction script..."

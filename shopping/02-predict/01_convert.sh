@@ -20,8 +20,12 @@ source .venv/bin/activate
 
 # Install requirements
 if [ -f "requirements.txt" ]; then
-    echo "Installing dependencies..."
-    pip install -r requirements.txt
+    if python3 -c "import pymupdf4llm" >/dev/null 2>&1; then
+        echo "Dependencies already available; skipping install."
+    else
+        echo "Installing dependencies..."
+        pip install -r requirements.txt
+    fi
 else
     echo "Error: requirements.txt not found."
     exit 1
