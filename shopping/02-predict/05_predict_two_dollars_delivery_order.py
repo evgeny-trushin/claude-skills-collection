@@ -44,6 +44,11 @@ ORDERS_PER_WEEK = 2   # optimal for catching discounts
 ORDER_DAYS = ["Tuesday", "Saturday"]  # best days for Coles discounts
 ORDER_OFFSETS = [1, 5]  # Tuesday=1, Saturday=5 (Monday=0)
 PREDICTION_WINDOW_DAYS = 21  # plan 3 weeks ahead from last invoice
+STOCK_STALENESS_DAYS = 90  # stock snapshots older than this are ignored (estimate from history instead)
+FORGOT_TOLERANCE = 1.8  # flag a staple when days-since-last > tolerance * median interval
+RECENCY_HALFLIFE_ORDERS = 4  # exponential half-life (in orders) for recency-weighted consumption
+PROVISIONAL_STAPLE_RECURRENCES = 3  # purchases within the recent window to count as a new staple
+PROVISIONAL_STAPLE_WINDOW_DAYS = 45  # recent window for provisional-staple detection
 
 # Promotional pattern insights from historical data
 BEST_DISCOUNT_DAYS = ["Tuesday", "Friday", "Saturday"]
@@ -78,6 +83,94 @@ def load_in_stock():
     except Exception as e:
         print(red(f"Warning: Error loading in-stock.json: {e}"))
         return {}, None
+
+
+def is_provisional_staple(dates, reference_date,
+                          min_recurrences=PROVISIONAL_STAPLE_RECURRENCES,
+                          window_days=PROVISIONAL_STAPLE_WINDOW_DAYS):
+    """True for newly-adopted fast staples: enough purchases inside the recent window."""
+    if dates is None or reference_date is None:
+        return False
+    cutoff = reference_date - timedelta(days=window_days)
+    recent = [d for d in dates if d >= cutoff]
+    return len(recent) >= min_recurrences
+
+
+def recency_weighted_daily_rate(dates, quantities, halflife=RECENCY_HALFLIFE_ORDERS):
+    """Daily consumption rate weighting recent shops more.
+
+    Recency-weighted average quantity-per-order (most recent order weighted
+    highest, exponential half-life = `halflife` orders) divided by the average
+    inter-purchase interval. Accelerating staples (rising quantities) therefore
+    get a higher rate than a flat all-orders-equal mean. Returns 0.0 for fewer
+    than two purchases or when intervals can't be computed.
+    """
+    if dates is None or len(dates) < 2:
+        return 0.0
+    pairs = sorted(zip(dates, quantities), key=lambda t: t[0])
+    sorted_dates = [p[0] for p in pairs]
+    sorted_qtys = [p[1] for p in pairs]
+
+    intervals = [(sorted_dates[i] - sorted_dates[i - 1]).days for i in range(1, len(sorted_dates))]
+    intervals = [d for d in intervals if d > 0]
+    if not intervals:
+        return 0.0
+    avg_interval = sum(intervals) / len(intervals)
+
+    decay = 0.5 ** (1.0 / max(1, halflife))
+    n = len(sorted_qtys)
+    weighted_sum = 0.0
+    weight_total = 0.0
+    for i in range(n):
+        weight = decay ** ((n - 1) - i)  # most recent order weight 1, older decay
+        weighted_sum += sorted_qtys[i] * weight
+        weight_total += weight
+    weighted_avg_qty = weighted_sum / weight_total
+    return weighted_avg_qty / avg_interval
+
+
+def find_forgotten_staples(df_grouped, reference_date, dont_order_set,
+                           generic_mappings, min_orders=3, tolerance=FORGOT_TOLERANCE,
+                           product_prices=None):
+    """Return regulars now overdue vs their own cadence (likely forgotten).
+
+    Each result: {product, median_interval, last_bought, days_since, overdue_ratio},
+    sorted by overdue_ratio descending. Blocked products are excluded. When
+    product_prices is given, products with no positive price (flyers, magazines,
+    promo entries) are excluded as non-orderable.
+    """
+    results = []
+    for product, pdf in df_grouped.groupby("product"):
+        if is_product_blocked(product, dont_order_set, generic_mappings):
+            continue
+        if product_prices is not None and product_prices.get(product, {}).get("price", 0) <= 0:
+            continue
+        dates = sorted(pd.Series(pdf["ds"].unique()))
+        if len(dates) < min_orders:
+            continue
+        intervals = pd.Series(dates).diff().dt.days.dropna()
+        median_interval = intervals.median()
+        if not median_interval or median_interval <= 0:
+            continue
+        last_bought = dates[-1]
+        days_since = (reference_date - last_bought).days
+        if days_since > tolerance * median_interval:
+            results.append({
+                "product": product,
+                "median_interval": float(median_interval),
+                "last_bought": last_bought,
+                "days_since": int(days_since),
+                "overdue_ratio": days_since / median_interval,
+            })
+    results.sort(key=lambda r: r["overdue_ratio"], reverse=True)
+    return results
+
+
+def is_stock_stale(stock_date, reference_date, max_age_days=STOCK_STALENESS_DAYS):
+    """True when the stock snapshot is older than max_age_days and should not be trusted."""
+    if stock_date is None or reference_date is None:
+        return False
+    return (reference_date - stock_date).days > max_age_days
 
 
 def load_dont_order():
@@ -148,6 +241,20 @@ def is_product_blocked(product, dont_order_set, generic_mappings):
     return False
 
 
+def explain_block(product, dont_order_set, generic_mappings):
+    """If blocked, return a reason string naming the trigger; else None."""
+    if not is_product_blocked(product, dont_order_set, generic_mappings):
+        return None
+    if product in dont_order_set:
+        return f"on dont-order list ({product})"
+    generic_name = find_generic_product(product, generic_mappings)
+    if generic_name:
+        for p in generic_mappings[generic_name]:
+            if is_product_blocked(p, dont_order_set, {}):
+                return f"category '{generic_name}' blocked via {p}"
+    return "matched a dont-order entry"
+
+
 def match_product_to_stock(product_name, in_stock_dict):
     """Fuzzy match a product name to items in the in-stock dictionary."""
     # Normalize the product name: remove %, strip, lowercase
@@ -175,6 +282,66 @@ def match_product_to_stock(product_name, in_stock_dict):
     return None
 
 
+def load_product_families():
+    """Load consumption-only product families (separate from block-scope groups)."""
+    path = os.path.join(OUTPUT_DIR, "product-families.json")
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f).get("families", {})
+    return {}
+
+
+def apply_product_families(df_grouped, families):
+    """Relabel family SKUs to their family name so consumption pools into one series."""
+    if not families:
+        return df_grouped
+    sku_to_family = {}
+    for fam, skus in families.items():
+        for sku in skus:
+            sku_to_family[sku] = fam
+    out = df_grouped.copy()
+    out["product"] = out["product"].map(lambda p: sku_to_family.get(p, p))
+    return out.groupby(["product", "ds"], as_index=False)["y"].sum()
+
+
+def merge_family_prices(product_prices, families):
+    """Give each family name the price of its most-recently-priced member."""
+    out = dict(product_prices)
+    for fam, skus in families.items():
+        entries = [product_prices[s] for s in skus if s in product_prices]
+        if not entries:
+            continue
+        out[fam] = dict(max(entries, key=lambda e: e.get("date", pd.Timestamp.min)))
+    return out
+
+
+def is_future_invoice(date, today):
+    """True when an invoice date is after today (data artifact, e.g. filename typo)."""
+    return date is not None and today is not None and date > today
+
+
+def invoice_signature(invoice):
+    """Identity of an invoice by date + its (product, ordered) items, for dedup."""
+    items = []
+    for category in invoice.get("categories", []):
+        for item in category.get("items", []):
+            items.append((item.get("product"), str(item.get("ordered"))))
+    return (invoice.get("invoice_date"), tuple(sorted(items)))
+
+
+def dedupe_invoices(invoices):
+    """Drop invoices whose (date + items) signature was already seen (true duplicates)."""
+    seen = set()
+    out = []
+    for invoice in invoices:
+        sig = invoice_signature(invoice)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(invoice)
+    return out
+
+
 def load_grouped_orders():
     data_file = os.path.join(OUTPUT_DIR, "extracted_data.json")
     if not os.path.exists(data_file):
@@ -184,6 +351,12 @@ def load_grouped_orders():
     with open(data_file, "r") as f:
         data = json.load(f)
 
+    raw_count = len(data)
+    data = dedupe_invoices(data)
+    if len(data) < raw_count:
+        print(yellow(f"Deduplicated {raw_count - len(data)} duplicate invoice(s)."))
+
+    today = pd.Timestamp.now().normalize()
     rows = []
     product_prices = {}  # Most recent price per product
     price_history = {}   # Full price history: {product: [(date, price, qty), ...]}
@@ -201,6 +374,10 @@ def load_grouped_orders():
                 date = pd.to_datetime(date_str)
             except Exception:
                 continue
+
+        if is_future_invoice(date, today):
+            print(yellow(f"Skipping future-dated invoice: {date_str}"))
+            continue
 
         # Track the most recent invoice date
         if last_invoice_date is None or date > last_invoice_date:
@@ -241,6 +418,10 @@ def load_grouped_orders():
         return None, product_prices, last_invoice_date, price_history
 
     df_grouped = df.groupby(["product", "ds"]).sum().reset_index()
+    families = load_product_families()
+    if families:
+        df_grouped = apply_product_families(df_grouped, families)
+        product_prices = merge_family_prices(product_prices, families)
     return df_grouped, product_prices, last_invoice_date, price_history
 
 
@@ -414,6 +595,11 @@ def calculate_consumption_metrics(df, oldest_invoice_date):
             daily_rate = avg_qty_per_order / avg_interval
         else:
             daily_rate = avg_qty_per_order / 7  # Default to weekly
+        # Recency weighting: lift accelerating staples, never under-predict steady ones
+        per_date = df.groupby("ds")["y"].sum().sort_index()
+        rw = recency_weighted_daily_rate(list(per_date.index), list(per_date.values))
+        if rw > 0:
+            daily_rate = max(daily_rate, rw)
     else:
         # Single order: consumption period is from oldest invoice to this order
         total_period = (last_date - oldest_invoice_date).days
@@ -489,6 +675,8 @@ def compute_product_stats(df_grouped, product_prices, last_invoice_date, predict
         if order_count >= 3 and avg_interval is not None and avg_interval <= 14:
             frequent = True
         elif weekly_need >= 0.5:
+            frequent = True
+        if is_provisional_staple(sorted(group_daily_df["ds"].tolist()), prediction_start):
             frequent = True
 
         # Calculate Group Actual Stock (Sum of all matches)
@@ -633,11 +821,13 @@ def compute_product_stats(df_grouped, product_prices, last_invoice_date, predict
             continue
 
         weekly_need = daily_rate * 7
-        
+
         frequent = False
         if order_count >= 3 and avg_interval is not None and avg_interval <= 14:
             frequent = True
         elif weekly_need >= 0.5:
+            frequent = True
+        if is_provisional_staple(sorted(product_df["ds"].tolist()), prediction_start):
             frequent = True
 
         max_per_order = max(1, math.ceil(avg_qty_per_order))
@@ -1371,11 +1561,28 @@ def _build_reorder_prompt(order):
     return "\n".join(lines).strip() + "\n"
 
 
+def _build_combined_reorder_prompt(orders):
+    # One prompt for agents/browser automation that should place the whole plan.
+    lines = [
+        "Reorder via https://www.coles.com.au",
+        "these items:",
+    ]
+
+    active_orders = [o for o in orders if not o.get("skipped") and o.get("items")]
+    for order in active_orders:
+        for item in sorted(order.get("items", []), key=lambda x: -x.get("total_price", 0)):
+            product_name = str(item.get("product", "")).lstrip("%").strip()
+            qty = item.get("qty", 0)
+            lines.append(f"{product_name} x{qty}")
+
+    return "\n".join(lines).strip() + "\n"
+
+
 def write_html_report(orders, product_stats, last_invoice_date, prediction_start, horizon_end, output_path):
     """
     Write a standalone HTML report with:
     - clean, readable tables per order
-    - a textarea "prompt" per order + copy button
+    - one textarea prompt that contains every active order item
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
@@ -1518,9 +1725,6 @@ h1{
 .badge-warn{border-color:rgba(160,96,0,.25); color:var(--warn)}
 .badge-bad{border-color:rgba(166,27,43,.25); color:var(--bad)}
 .body{
-  display:grid;
-  grid-template-columns:1.3fr .7fr;
-  gap:14px;
   padding:14px 16px 16px;
 }
 .table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px;background:rgba(255,255,255,.55)}
@@ -1559,6 +1763,8 @@ tbody tr:nth-child(odd){background:rgba(255,255,255,.35)}
   flex-direction:column;
   min-height:260px;
 }
+.prompt-all{min-height:0}
+.prompt-all textarea{min-height:320px}
 .prompt-h{
   display:flex;align-items:center;justify-content:space-between;gap:10px;
   padding:10px 10px;
@@ -1612,7 +1818,6 @@ textarea{
   font-size:12px;
 }
 @media (max-width: 980px){
-  .body{grid-template-columns:1fr}
   table{min-width:620px}
 }
 """)
@@ -1643,6 +1848,27 @@ textarea{
     if skipped_orders:
         parts.append(f'<div class="foot">Skipped/merged orders: {len(skipped_orders)} (merged into nearby orders).</div>')
 
+    combined_prompt_id = "prompt-all"
+    combined_prompt_text = _build_combined_reorder_prompt(active_orders)
+    parts.append('    <section class="card">')
+    parts.append('      <div class="card-h">')
+    parts.append('        <div class="when">Combined Order Prompt<small>All active order items in one copyable prompt</small></div>')
+    parts.append('        <div class="badges">')
+    parts.append(badge(f"{orders_placed} orders", "ok" if orders_placed else "warn"))
+    parts.append(badge(f"{sum(len(o.get('items', [])) for o in active_orders)} items", "ok" if active_orders else "warn"))
+    parts.append("        </div>")
+    parts.append("      </div>")
+    parts.append('      <div class="body">')
+    parts.append('        <aside class="prompt prompt-all">')
+    parts.append('          <div class="prompt-h">')
+    parts.append('            <b>Copyable Order Prompt</b>')
+    parts.append(f'            <button class="btn" type="button" onclick="copyPrompt({html.escape(repr(combined_prompt_id))})">Copy</button>')
+    parts.append("          </div>")
+    parts.append(f'          <textarea id="{html.escape(combined_prompt_id)}" readonly spellcheck="false">{html.escape(combined_prompt_text)}</textarea>')
+    parts.append("        </aside>")
+    parts.append("      </div>")
+    parts.append("    </section>")
+
     parts.append('    <div class="grid">')
 
     for idx, order in enumerate(active_orders, start=1):
@@ -1661,9 +1887,6 @@ textarea{
         when_sub = f"in {days_until} day(s)" if days_until >= 0 else f"{abs(days_until)} day(s) ago"
         if urgent:
             when_sub += " (soon)"
-
-        prompt_id = f"prompt-{idx}"
-        prompt_text = _build_reorder_prompt(order)
 
         parts.append('      <section class="card">')
         parts.append('        <div class="card-h">')
@@ -1731,13 +1954,6 @@ textarea{
         parts.append("            </table>")
         parts.append("          </div>")
 
-        parts.append('          <aside class="prompt">')
-        parts.append('            <div class="prompt-h">')
-        parts.append('              <b>Copyable Prompt</b>')
-        parts.append(f'              <button class="btn" type="button" onclick="copyPrompt({html.escape(repr(prompt_id))})">Copy</button>')
-        parts.append("            </div>")
-        parts.append(f'            <textarea id="{html.escape(prompt_id)}" readonly spellcheck="false">{html.escape(prompt_text)}</textarea>')
-        parts.append("          </aside>")
         parts.append("        </div>")
 
         if order.get("notes"):
@@ -2167,6 +2383,15 @@ def predict_two_dollar_delivery_orders(analyze_group=None):
         print(f"Last invoice is over 3 weeks old; no forward window to plan.")
         return
 
+    if is_stock_stale(stock_date, prediction_start):
+        age = (prediction_start - stock_date).days
+        print(yellow(bold(
+            f"⚠ Stock snapshot is {age} days old (> {STOCK_STALENESS_DAYS}); "
+            f"ignoring it and estimating stock from purchase history. "
+            f"Refresh in-stock.json for accuracy."
+        )))
+        in_stock_dict, stock_date = {}, None
+
     product_stats = compute_product_stats(df_grouped, product_prices, last_invoice_date, prediction_start, promo_info, in_stock_dict, stock_date, generic_mappings, dont_order)
     if not product_stats:
         print(red("No products with measurable demand."))
@@ -2191,21 +2416,20 @@ def predict_two_dollar_delivery_orders(analyze_group=None):
         else:
             print(red(f"✗ No matches for '{debug_prod}' in product_stats - product was filtered during compute_product_stats"))
 
-    # Filter out products in dont-order list
-    skipped_blocked = 0
+    # Filter out blocked products, naming each drop and its trigger
+    dropped = []
     filtered_stats = {}
     for product, stats in product_stats.items():
-        if is_product_blocked(product, dont_order, generic_mappings):
-            skipped_blocked += 1
-            # DEBUG: Check if it's one of our target products
-            for debug_prod in DEBUG_PRODUCTS:
-                if debug_prod.lower() in product.lower() or product.lower() in debug_prod.lower():
-                    print(red(f"DEBUG: '{product}' was BLOCKED by dont-order list"))
+        reason = explain_block(product, dont_order, generic_mappings)
+        if reason:
+            dropped.append((product, reason))
         else:
             filtered_stats[product] = stats
     product_stats = filtered_stats
-    if skipped_blocked > 0:
-        print(yellow(f"Skipped {skipped_blocked} products (in dont-order list)"))
+    if dropped:
+        print(yellow(f"\nDropped {len(dropped)} product(s):"))
+        for product, reason in dropped:
+            print(yellow(f"  - {product[:50]:50} | {reason}"))
     
     # DEBUG: Final check after dont-order filtering
     print(cyan(f"\n{'='*80}"))
@@ -2244,6 +2468,17 @@ def predict_two_dollar_delivery_orders(analyze_group=None):
             order["items_total"] = sum(item["total_price"] for item in order["items"])
             order["total_with_delivery"] = order["items_total"] + DELIVERY_FEE if order["items_total"] > 0 else 0
             order["meets_minimum"] = order["items_total"] >= MIN_ORDER_TOTAL
+
+    forgotten = find_forgotten_staples(df_grouped, prediction_start, dont_order, generic_mappings,
+                                       product_prices=product_prices)
+    if forgotten:
+        print(yellow(bold("\n⚠ FORGOT TO ORDER? Staples overdue vs your usual cadence:")))
+        for r in forgotten[:15]:
+            print(yellow(
+                f"  {r['product'][:50]:50} | every ~{r['median_interval']:.0f}d | "
+                f"last {r['last_bought'].strftime('%Y-%m-%d')} | "
+                f"{r['days_since']}d ago ({r['overdue_ratio']:.1f}x)"
+            ))
 
     print_weekly_plan(orders, product_stats, last_invoice_date, prediction_start, horizon_end)
     report_path = os.path.join(OUTPUT_DIR, "two-dollar-delivery-order-plan.html")
